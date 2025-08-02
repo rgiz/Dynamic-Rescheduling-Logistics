@@ -1,0 +1,4 @@
+ortools>=9.14
+pytest>=8.0
+setuptools>=68
+wheel>=0.43
