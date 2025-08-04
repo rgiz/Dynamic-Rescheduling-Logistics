@@ -27,7 +27,16 @@ MILEAGE   = "segment_osrm_distance" # km for this segment (float)
 # Aggregated columns produced during ETL (df_trips, df_routes)
 # ────────────────────────────────────────────────────────────────────────────
 
-ROUTE_START_TS = "route_start_time"   # earliest segment start per route
-ROUTE_END_TS   = "route_end_time"     # latest segment end per route
-ROUTE_TOTAL_TIME = "route_total_time"
+# Routes CSV actual column names (based on your generated files)
+ROUTE_START_TS = "route_start_time"       # earliest segment start per route
+ROUTE_END_TS   = "route_end_time"         # latest segment end per route
+ROUTE_TOTAL_TIME = "route_total_time"     # total shift duration (for backward compatibility)
+ROUTE_SHIFT_DURATION = "route_shift_duration"  # total shift duration (elapsed time)
+ROUTE_DRIVING_TIME = "route_driving_time" # total active driving time
 ROUTE_TOTAL_DIST = "route_total_distance"
+
+# Additional columns found in your actual CSV files
+TRIP_DURATION = "trip_duration_minutes"  # derived duration field in trips.csv
+ROUTE_START_LOC = "route_start_location"
+ROUTE_END_LOC = "route_end_location"
+NUM_TRIPS = "num_trips"

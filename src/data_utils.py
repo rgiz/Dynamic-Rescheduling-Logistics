@@ -51,7 +51,7 @@ def group_by_trip(df: pd.DataFrame) -> pd.DataFrame:
         'destination_center': 'last',        # from sorted segments
     }).reset_index()
 
-    # Compute clock-time trip duration
+    # Compute clock-time trip duration (elapsed time from start to end)
     grouped['trip_duration_minutes'] = (grouped['od_end_time'] - grouped['od_start_time']).dt.total_seconds() / 60.0
 
     return grouped
@@ -60,34 +60,51 @@ def group_by_trip(df: pd.DataFrame) -> pd.DataFrame:
 def group_by_route(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregate at the route level. One row per route_schedule_uuid.
-    Computes total time, distance, and start/end info.
+    Computes both total driving time and total shift duration for regulatory compliance.
     """
     group_col = "route_schedule_uuid"
 
     grouped = df.groupby(group_col).agg({
         "trip_uuid": "nunique",
         "segment_osrm_distance": "sum",
-        "od_start_time": "min",
-        "od_end_time": "max",
+        "segment_actual_time": "sum",    # Total driving time (active)
+        "od_start_time": "min",          # Shift start time
+        "od_end_time": "max",            # Shift end time
     }).reset_index()
+
+    # Calculate total shift duration (elapsed time including breaks)
+    shift_duration_minutes = (grouped["od_end_time"] - grouped["od_start_time"]).dt.total_seconds() / 60.0
 
     grouped = grouped.rename(columns={
         "trip_uuid": "num_trips",
         "segment_osrm_distance": "route_total_distance",
+        "segment_actual_time": "route_driving_time",     # Active driving time
         "od_start_time": "route_start_time",
         "od_end_time": "route_end_time"
     })
 
+    # Add the shift duration as a separate column
+    grouped["route_shift_duration"] = shift_duration_minutes
+
+    # For regulatory compliance and optimization, we might want total time to refer to shift duration
+    # But keep both metrics available
+    grouped["route_total_time"] = shift_duration_minutes  # For backward compatibility with tests
+
     # For all values derived from sorted sequences, use df.groupby().apply()
     sorted_groups = df.groupby(group_col)
 
-    grouped["route_start_location"] = sorted_groups.apply(lambda g: g.sort_values("od_start_time").iloc[0]["source_center"]).values
-    grouped["route_end_location"] = sorted_groups.apply(lambda g: g.sort_values("od_start_time").iloc[-1]["destination_center"]).values
-    grouped["route_total_time"] = (
-        grouped["route_end_time"] - grouped["route_start_time"]
-    ).dt.total_seconds() / 60.0
+    grouped["route_start_location"] = sorted_groups.apply(
+        lambda g: g.sort_values("od_start_time").iloc[0]["source_center"], 
+        include_groups=False  # Suppress the pandas warning
+    ).values
+    
+    grouped["route_end_location"] = sorted_groups.apply(
+        lambda g: g.sort_values("od_start_time").iloc[-1]["destination_center"],
+        include_groups=False  # Suppress the pandas warning
+    ).values
 
     return grouped
+
 
 def load_or_generate_coordinates(project_root: Path = None) -> pd.DataFrame:
     if project_root is None:
