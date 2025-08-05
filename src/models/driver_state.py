@@ -126,6 +126,34 @@ class DriverState:
                 return False, f"Insufficient rest: {rest_period/60:.1f}h < {required_rest/60:.1f}h"
         
         return True, "Compliant"
+
+    def validate_rest_compliance_with_emergency(self, date: str, next_date: str) -> tuple[bool, str]:
+        """
+        Validate rest period with emergency rest option.
+        This is a separate method for when emergency rest is explicitly considered.
+        """
+        current_day_start, current_day_end = self.get_work_day_bounds(date)
+        next_day_start, next_day_end = self.get_work_day_bounds(next_date)
+        
+        if not current_day_end or not next_day_start:
+            return True, "No work scheduled"
+        
+        rest_period = (next_day_start - current_day_end).total_seconds() / 60
+        
+        # Check if this spans a weekend (weekend rest cannot be emergency)
+        if self._spans_weekend(current_day_end, next_day_start):
+            if rest_period < WEEKEND_REST_MIN:
+                return False, f"Weekend rest too short: {rest_period/60:.1f}h < {WEEKEND_REST_MIN/60}h"
+        
+        # Check standard rest first
+        if rest_period >= STANDARD_REST_MIN:
+            return True, "Compliant"
+        
+        # Check emergency rest if standard fails
+        if self.can_use_emergency_rest() and rest_period >= EMERGENCY_REST_MIN:
+            return True, f"Emergency rest needed: {rest_period/60:.1f}h"
+        
+        return False, f"Insufficient rest: {rest_period/60:.1f}h < {STANDARD_REST_MIN/60:.1f}h"
     
     def add_assignment(self, date: str, assignment: DailyAssignment) -> bool:
         """

@@ -142,28 +142,47 @@ class TestDriverState:
         assignment1 = DailyAssignment(
             trip_id="TRIP_001",
             start_time=datetime(2025, 8, 5, 8, 0),
-            end_time=datetime(2025, 8, 5, 16, 0),
+            end_time=datetime(2025, 8, 5, 16, 0),  # Ends at 4 PM
             duration_minutes=480,
             start_location="LOC_A",
             end_location="LOC_B"
         )
-        
-        # Day 2: Work 6am-2pm (10 hours rest - TOO SHORT)
+
+        # Day 2: Work 1am-9am (9 hours rest from 4pm to 1am - TOO SHORT EVEN FOR EMERGENCY)
         date2 = "2025-08-06"
         assignment2 = DailyAssignment(
             trip_id="TRIP_002",
-            start_time=datetime(2025, 8, 6, 6, 0),
-            end_time=datetime(2025, 8, 6, 14, 0),
+            start_time=datetime(2025, 8, 6, 1, 0),  # 1 AM = 9 hours rest (exactly at emergency limit)
+            end_time=datetime(2025, 8, 6, 9, 0),    # 9 AM
+            duration_minutes=480,
+            start_location="LOC_C",
+            end_location="LOC_D"
+        )
+
+        self.driver.add_assignment(date1, assignment1)
+        self.driver.add_assignment(date2, assignment2)
+
+        is_compliant, reason = self.driver.validate_rest_compliance(date1, date2)
+        
+        # 9 hours is exactly the emergency rest limit, so it should be compliant with emergency rest
+        assert is_compliant
+        assert "Emergency rest needed" in reason
+        
+        # Now test with LESS than 9 hours (8.5 hours) - this should truly fail
+        assignment2_too_early = DailyAssignment(
+            trip_id="TRIP_002", 
+            start_time=datetime(2025, 8, 6, 0, 30),  # 12:30 AM = 8.5 hours rest
+            end_time=datetime(2025, 8, 6, 8, 30),    
             duration_minutes=480,
             start_location="LOC_C",
             end_location="LOC_D"
         )
         
-        self.driver.add_assignment(date1, assignment1)
-        self.driver.add_assignment(date2, assignment2)
+        self.driver.remove_assignment(date2, "TRIP_002")
+        self.driver.add_assignment(date2, assignment2_too_early)
         
         is_compliant, reason = self.driver.validate_rest_compliance(date1, date2)
-        assert not is_compliant
+        assert not is_compliant  # 8.5 hours should NOT be compliant (less than 9h emergency minimum)
         assert "Insufficient rest" in reason
     
     def test_rest_compliance_emergency(self):

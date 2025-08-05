@@ -2,7 +2,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
-
+from .driver_state import (
+    DriverState, DailyAssignment, 
+    WEEKEND_REST_MIN, MAX_EMERGENCY_PER_WEEK, DAILY_DUTY_LIMIT_MIN,
+    STANDARD_REST_MIN, EMERGENCY_REST_MIN
+)
+from .cascading_insertion import CascadingInsertion
 
 @dataclass
 class WeekendBreak:
@@ -255,9 +260,51 @@ class WeeklySchedule:
         if date1 not in self.daily_states or date2 not in self.daily_states:
             return True, "No work scheduled"
         
-        return self.daily_states[date1].validate_rest_compliance(date1, date2)
+        # Get work day bounds from each day's DriverState
+        date1_start, date1_end = self.daily_states[date1].get_work_day_bounds(date1)
+        date2_start, date2_end = self.daily_states[date2].get_work_day_bounds(date2)
+        
+        if not date1_end or not date2_start:
+            return True, "No work scheduled"
+        
+        # Calculate rest period
+        rest_period_minutes = (date2_start - date1_end).total_seconds() / 60
+        
+        # Check if this spans a weekend
+        date1_dt = datetime.strptime(date1, '%Y-%m-%d')
+        date2_dt = datetime.strptime(date2, '%Y-%m-%d')
+        
+        spans_weekend = self._spans_weekend(date1_end, date2_start)
+        
+        if spans_weekend:
+            if rest_period_minutes < WEEKEND_REST_MIN:
+                return False, f"Weekend rest too short: {rest_period_minutes/60:.1f}h < {WEEKEND_REST_MIN/60}h"
+        
+        # Check regular rest requirements
+        required_rest = STANDARD_REST_MIN  # 11 hours
+        
+        if rest_period_minutes < required_rest:
+            # Could we use emergency rest?
+            if self.can_use_emergency_rest() and rest_period_minutes >= EMERGENCY_REST_MIN:
+                return True, f"Emergency rest needed: {rest_period_minutes/60:.1f}h"
+            else:
+                return False, f"Insufficient rest: {rest_period_minutes/60:.1f}h < {required_rest/60:.1f}h"
+        
+        return True, "Compliant"
+
+    def _spans_weekend(self, start: datetime, end: datetime) -> bool:
+        """Check if a time period spans a weekend."""
+        # Simple weekend detection - could be enhanced based on business rules
+        start_weekday = start.weekday()  # 0=Monday, 6=Sunday
+        end_weekday = end.weekday()
+        
+        # If we go from Friday (4) to Monday (0) or span Saturday/Sunday
+        if start_weekday >= 4 and end_weekday <= 1:
+            return True
+        if (end - start).days >= 2:  # Multi-day span likely includes weekend
+            return True
     
-    def simulate_insertion(self, insertion: CascadingInsertion) -> Tuple[bool, List[str]]:
+    def simulate_insertion(self, insertion: 'CascadingInsertion') -> Tuple[bool, List[str]]:
         """
         Simulate a cascading insertion to check feasibility without modifying state.
         
