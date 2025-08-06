@@ -159,8 +159,8 @@ class MultiDriverCPSATModel:
     
     def _debug_model_setup(self, disrupted_trips, candidates_per_trip):
         """Add debug output to identify setup issues."""
-        print(f"\n🔍 DEBUG: Model setup analysis")
-        print(f"  Disrupted trips: {len(disrupted_trips)}")
+        # print(f"\n🔍 DEBUG: Model setup analysis")
+        # print(f"  Disrupted trips: {len(disrupted_trips)}")
         
         total_candidates = 0
         trips_without_candidates = 0
@@ -168,13 +168,13 @@ class MultiDriverCPSATModel:
         for trip_id, candidates in candidates_per_trip.items():
             if not candidates:
                 trips_without_candidates += 1
-                print(f"  ❌ Trip {trip_id}: NO CANDIDATES")
+                # print(f"  ❌ Trip {trip_id}: NO CANDIDATES")
             else:
                 total_candidates += len(candidates)
-                print(f"  ✅ Trip {trip_id}: {len(candidates)} candidates")
+                # print(f"  ✅ Trip {trip_id}: {len(candidates)} candidates")
         
-        print(f"  Total candidates: {total_candidates}")
-        print(f"  Trips without candidates: {trips_without_candidates}")
+        # print(f"  Total candidates: {total_candidates}")
+        # print(f"  Trips without candidates: {trips_without_candidates}")
         
         if trips_without_candidates > 0:
             print(f"  ⚠️  WARNING: {trips_without_candidates} trips have no candidates!")
@@ -453,13 +453,13 @@ class MultiDriverCPSATModel:
         status = self.solver.Solve(self.model)
         
         # Print solver statistics
-        print(f"\nSolver Statistics:")
-        print(f"  Status: {self.solver.StatusName(status)}")
-        if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-            print(f"  Objective: {self.solver.ObjectiveValue()}")
-        print(f"  Time: {self.solver.WallTime():.2f}s")
-        print(f"  Branches: {self.solver.NumBranches()}")
-        print(f"  Conflicts: {self.solver.NumConflicts()}")
+        # print(f"\nSolver Statistics:")
+        # print(f"  Status: {self.solver.StatusName(status)}")
+        # if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        #     print(f"  Objective: {self.solver.ObjectiveValue()}")
+        # print(f"  Time: {self.solver.WallTime():.2f}s")
+        # print(f"  Branches: {self.solver.NumBranches()}")
+        # print(f"  Conflicts: {self.solver.NumConflicts()}")
         
         return self.solver, status
     
