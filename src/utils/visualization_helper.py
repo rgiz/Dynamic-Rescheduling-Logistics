@@ -1,387 +1,422 @@
 """
 Visualization Helper for Dynamic Trip Rescheduling
-===================================================
+==================================================
 
-This module provides visualization utilities for the optimization results.
-Keeps visualization logic in the backend rather than cluttering notebooks.
-
-Place this file in: src/utils/visualization_helper.py
+Focuses on clear operational metrics:
+- Average delay per reassigned trip (including downstream impacts)
+- Average extra miles per reassigned trip
+- Clear comparisons between baseline and optimized solutions
 """
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Any, Tuple
+import seaborn as sns
+
+# Set style for better-looking plots
+plt.style.use('seaborn-v0_8-whitegrid')
+sns.set_palette("husl")
 
 
 class MetricsVisualizer:
-    """Handles all visualization for optimization metrics."""
+    """Handles visualization for optimization metrics with focus on operational metrics."""
     
     @staticmethod
-    def get_cost_breakdown(metrics) -> tuple[List[str], List[float]]:
+    def extract_operational_metrics(solution) -> Dict[str, float]:
         """
-        Extract cost components from metrics object dynamically.
+        Extract operational metrics from a solution.
         
         Returns:
-            Tuple of (component_names, component_values)
+            Dict with detailed operational metrics
         """
-        components = []
-        values = []
+        metrics = {
+            'total_delay_minutes': 0,
+            'total_deadhead_miles': 0,
+            'reassigned_count': 0,
+            'outsourced_count': 0,
+            'avg_delay_per_reassigned': 0,
+            'avg_miles_per_reassigned': 0,
+            'max_delay': 0,
+            'trips_with_zero_delay': 0,
+            'trips_with_delays': 0
+        }
         
-        # Check for each possible cost attribute
-        if hasattr(metrics.cost, 'deadhead_cost') and metrics.cost.deadhead_cost > 0:
-            components.append('Deadhead')
-            values.append(metrics.cost.deadhead_cost)
+        if not solution or not solution.assignments:
+            return metrics
         
-        if hasattr(metrics.cost, 'delay_cost') and metrics.cost.delay_cost > 0:
-            components.append('Delays')
-            values.append(metrics.cost.delay_cost)
-        elif hasattr(metrics.cost, 'delay_penalty') and metrics.cost.delay_penalty > 0:
-            components.append('Delay Penalty')
-            values.append(metrics.cost.delay_penalty)
-        elif hasattr(metrics.cost, 'lateness_cost') and metrics.cost.lateness_cost > 0:
-            components.append('Lateness')
-            values.append(metrics.cost.lateness_cost)
-            
-        if hasattr(metrics.cost, 'outsourcing_cost') and metrics.cost.outsourcing_cost > 0:
-            components.append('Outsourcing')
-            values.append(metrics.cost.outsourcing_cost)
-            
-        if hasattr(metrics.cost, 'emergency_rest_penalty') and metrics.cost.emergency_rest_penalty > 0:
-            components.append('Emergency Rest')
-            values.append(metrics.cost.emergency_rest_penalty)
-            
-        if hasattr(metrics.cost, 'reassignment_cost') and metrics.cost.reassignment_cost > 0:
-            components.append('Reassignment')
-            values.append(metrics.cost.reassignment_cost)
+        delays = []
+        miles = []
         
-        # Add 'Other' for any remaining cost
-        total_identified = sum(values)
-        if metrics.cost.total_cost > total_identified:
-            components.append('Other')
-            values.append(metrics.cost.total_cost - total_identified)
-        
-        return components, values
-    
-    @staticmethod
-    def get_average_deadhead(metrics) -> str:
-        """
-        Calculate average deadhead from available metrics.
-        
-        Returns:
-            Formatted string with average deadhead
-        """
-        if metrics.operational.successfully_reassigned == 0:
-            return "N/A"
-            
-        if hasattr(metrics.cost, 'deadhead_minutes'):
-            avg = metrics.cost.deadhead_minutes / metrics.operational.successfully_reassigned
-            return f"{avg:.1f} min"
-        elif hasattr(metrics.cost, 'deadhead_cost'):
-            # Estimate from cost if minutes not available
-            avg = metrics.cost.deadhead_cost / metrics.operational.successfully_reassigned
-            return f"~${avg:.1f}"
-        else:
-            return "N/A"
-    
-    @staticmethod
-    def create_comparison_figure(baseline_solution, baseline_metrics,
-                                optimized_solution, optimized_metrics,
-                                disrupted_trips, bo_tuner=None):
-        """
-        Create comprehensive visualization comparing CP-SAT baseline vs BO-optimized results.
-        
-        Args:
-            baseline_solution: CP-SAT solution with default weights
-            baseline_metrics: Metrics from baseline solution
-            optimized_solution: CP-SAT solution with BO-tuned weights
-            optimized_metrics: Metrics from optimized solution
-            disrupted_trips: List of disrupted trips
-            bo_tuner: Optional Bayesian optimization tuner
-            
-        Returns:
-            fig: The matplotlib figure object
-        """
-        fig = plt.figure(figsize=(15, 10))
-        
-        # Use optimized metrics as primary, baseline for comparison
-        metrics = optimized_metrics
-        baseline = baseline_metrics if baseline_metrics else optimized_metrics
-        
-        # Calculate improvements (might be 0 if both achieved same result)
-        cost_improvement = baseline.cost.total_cost - metrics.cost.total_cost if baseline else 0
-        cost_improvement_pct = (cost_improvement / baseline.cost.total_cost * 100) if baseline and baseline.cost.total_cost > 0 else 0
-        
-        # 1. Cost Comparison (top left) - CP-SAT Default vs CP-SAT+BO
-        ax1 = plt.subplot(2, 3, 1)
-        scenarios = ['CP-SAT\n(Default Weights)', 'CP-SAT+BO\n(Tuned Weights)']
-        costs = [
-            baseline.cost.total_cost if baseline else metrics.cost.total_cost,
-            metrics.cost.total_cost
-        ]
-        colors = ['#3498db', '#27ae60'] if cost_improvement >= 0 else ['#3498db', '#e74c3c']
-        bars = ax1.bar(scenarios, costs, color=colors, alpha=0.8)
-        ax1.set_ylabel('Total Cost ($)', fontsize=11)
-        ax1.set_title('Optimization Cost Comparison', fontsize=12, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
-        
-        # Add value labels
-        for bar, cost in zip(bars, costs):
-            ax1.text(bar.get_x() + bar.get_width()/2, cost, f'${cost:,.0f}',
-                    ha='center', va='bottom', fontsize=10)
-        
-        # Add improvement annotation only if there's a difference
-        if abs(cost_improvement) > 0.01:
-            if cost_improvement > 0:
-                improvement_text = f'BO Improvement:\n${cost_improvement:,.0f}\n({cost_improvement_pct:.1f}%)'
-                box_color = 'lightgreen'
+        for assignment in solution.assignments:
+            # Count assignment types
+            if assignment.get('type') == 'outsourced' or assignment.get('driver_id') is None:
+                metrics['outsourced_count'] += 1
             else:
-                improvement_text = f'No improvement\n(Same cost)'
-                box_color = 'lightyellow'
-            ax1.text(0.5, max(costs)*0.5, improvement_text, ha='center',
-                    bbox=dict(boxstyle='round', facecolor=box_color, alpha=0.5),
-                    fontsize=11, fontweight='bold')
-        else:
-            ax1.text(0.5, max(costs)*0.5, 'Same performance\n(BO found same\noptimal weights)', 
-                    ha='center',
-                    bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.5),
-                    fontsize=10)
+                metrics['reassigned_count'] += 1
+                
+                # Track delays for reassigned trips
+                delay = assignment.get('delay_minutes', 0)
+                delays.append(delay)
+                metrics['total_delay_minutes'] += delay
+                
+                if delay > 0:
+                    metrics['trips_with_delays'] += 1
+                    metrics['max_delay'] = max(metrics['max_delay'], delay)
+                else:
+                    metrics['trips_with_zero_delay'] += 1
+                
+                # Track deadhead miles for reassigned trips
+                deadhead_min = assignment.get('deadhead_minutes', 0)
+                # Convert minutes to miles (assuming 30 mph average speed)
+                deadhead_miles = (deadhead_min / 60) * 30
+                miles.append(deadhead_miles)
+                metrics['total_deadhead_miles'] += deadhead_miles
         
-        # 2. Assignment Comparison (top middle)
+        # Calculate averages for reassigned trips only
+        if metrics['reassigned_count'] > 0:
+            metrics['avg_delay_per_reassigned'] = metrics['total_delay_minutes'] / metrics['reassigned_count']
+            metrics['avg_miles_per_reassigned'] = metrics['total_deadhead_miles'] / metrics['reassigned_count']
+        
+        return metrics
+    
+    @staticmethod
+    def create_comparison_dashboard(baseline_solution, bo_solution, disrupted_trips, 
+                                   bo_tuner=None) -> plt.Figure:
+        """
+        Create a comprehensive dashboard comparing baseline and BO-optimized solutions.
+        Focuses on average delay minutes and average extra miles per reassigned trip.
+        """
+        # Extract metrics
+        baseline_metrics = MetricsVisualizer.extract_operational_metrics(baseline_solution)
+        bo_metrics = MetricsVisualizer.extract_operational_metrics(bo_solution)
+        
+        # Create figure with subplots
+        fig = plt.figure(figsize=(16, 10))
+        
+        # 1. Reassignment Success Pie Chart (top left)
+        ax1 = plt.subplot(2, 3, 1)
+        
+        # Use BO solution for pie chart (or baseline if BO not available)
+        metrics_for_pie = bo_metrics if bo_solution else baseline_metrics
+        sizes = [metrics_for_pie['reassigned_count'], metrics_for_pie['outsourced_count']]
+        
+        if sum(sizes) > 0:
+            labels = [f"Reassigned\n({sizes[0]} trips)", f"Outsourced\n({sizes[1]} trips)"]
+            colors = ['#2ecc71', '#e74c3c']
+            explode = (0.05, 0)
+            
+            wedges, texts, autotexts = ax1.pie(sizes, explode=explode, labels=labels, colors=colors,
+                                               autopct='%1.0f%%', shadow=True, startangle=90)
+            
+            # Make percentage text bold
+            for autotext in autotexts:
+                autotext.set_weight('bold')
+                autotext.set_fontsize(12)
+            
+            ax1.set_title(f'Trip Reassignment Results\n({len(disrupted_trips)} Disrupted Trips)', 
+                        fontweight='bold', fontsize=12)
+        else:
+            ax1.text(0.5, 0.5, 'No Assignments', ha='center', va='center', fontsize=14)
+            ax1.set_title('Trip Reassignment Results', fontweight='bold', fontsize=12)
+        
+        # 2. Average Delay Comparison (top center)
         ax2 = plt.subplot(2, 3, 2)
-        categories = ['Reassigned', 'Outsourced']
-        baseline_vals = [
-            baseline.operational.successfully_reassigned if baseline else 0,
-            baseline.operational.outsourced if baseline else len(disrupted_trips)
-        ]
-        optimized_vals = [
-            metrics.operational.successfully_reassigned,
-            metrics.operational.outsourced
+        
+        categories = ['Baseline\n(Default)', 'Optimized\n(BO)']
+        avg_delays = [
+            baseline_metrics['avg_delay_per_reassigned'],
+            bo_metrics['avg_delay_per_reassigned']
         ]
         
-        x = np.arange(len(categories))
-        width = 0.35
+        # Create bars with different colors
+        bars = ax2.bar(categories, avg_delays, color=['#3498db', '#e67e22'], width=0.5, edgecolor='black', linewidth=1.5)
         
-        bars1 = ax2.bar(x - width/2, baseline_vals, width, 
-                       label='CP-SAT Default', color='#3498db', alpha=0.8)
-        bars2 = ax2.bar(x + width/2, optimized_vals, width,
-                       label='CP-SAT+BO', color='#27ae60', alpha=0.8)
+        # Add value labels on bars
+        for bar, val in zip(bars, avg_delays):
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{val:.1f} min', ha='center', va='bottom', fontweight='bold', fontsize=11)
         
-        ax2.set_ylabel('Number of Trips', fontsize=11)
-        ax2.set_title('Trip Assignment Distribution', fontsize=12, fontweight='bold')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(categories)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3, axis='y')
+        ax2.set_ylabel('Average Delay per Reassigned Trip (minutes)', fontsize=11)
+        ax2.set_title('Service Impact: Average Delay\n(Including Downstream Effects)', fontweight='bold', fontsize=12)
+        ax2.set_ylim(0, max(avg_delays) * 1.3 if max(avg_delays) > 0 else 10)
+        ax2.grid(axis='y', alpha=0.3)
         
-        # Add value labels
-        for bars in [bars1, bars2]:
-            for bar in bars:
-                height = bar.get_height()
-                if height > 0:
-                    ax2.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{int(height)}', ha='center', va='bottom', fontsize=9)
+        # Add context: how many trips had delays
+        ax2.text(0.02, 0.98, f'Baseline: {baseline_metrics["trips_with_delays"]}/{baseline_metrics["reassigned_count"]} trips delayed',
+                transform=ax2.transAxes, fontsize=9, va='top')
+        ax2.text(0.02, 0.92, f'Optimized: {bo_metrics["trips_with_delays"]}/{bo_metrics["reassigned_count"]} trips delayed',
+                transform=ax2.transAxes, fontsize=9, va='top')
         
-        # 3. Performance Metrics Comparison (top right)
+        # 3. Average Extra Miles Comparison (top right)
         ax3 = plt.subplot(2, 3, 3)
-        metrics_names = ['Feasibility\nRate', 'On-Time\nRate']
-        baseline_values = [
-            baseline.operational.feasibility_rate * 100 if baseline else 0,
-            baseline.sla.on_time_rate * 100 if baseline else 0
-        ]
-        optimized_values = [
-            metrics.operational.feasibility_rate * 100,
-            metrics.sla.on_time_rate * 100
+        
+        categories = ['Baseline\n(Default)', 'Optimized\n(BO)']
+        avg_miles = [
+            baseline_metrics['avg_miles_per_reassigned'],
+            bo_metrics['avg_miles_per_reassigned']
         ]
         
-        x = np.arange(len(metrics_names))
-        bars1 = ax3.bar(x - width/2, baseline_values, width, 
-                       label='CP-SAT Default', color='#3498db', alpha=0.8)
-        bars2 = ax3.bar(x + width/2, optimized_values, width,
-                       label='CP-SAT+BO', color='#27ae60', alpha=0.8)
+        bars = ax3.bar(categories, avg_miles, color=['#9b59b6', '#1abc9c'], width=0.5, edgecolor='black', linewidth=1.5)
         
-        ax3.set_ylabel('Percentage (%)', fontsize=11)
-        ax3.set_ylim([0, 105])
-        ax3.set_title('Key Performance Indicators', fontsize=12, fontweight='bold')
-        ax3.set_xticks(x)
-        ax3.set_xticklabels(metrics_names)
-        ax3.legend()
-        ax3.grid(True, alpha=0.3, axis='y')
+        # Add value labels on bars
+        for bar, val in zip(bars, avg_miles):
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{val:.1f} mi', ha='center', va='bottom', fontweight='bold', fontsize=11)
         
-        # Add value labels
-        for bars in [bars1, bars2]:
-            for bar in bars:
-                val = bar.get_height()
-                ax3.text(bar.get_x() + bar.get_width()/2, val, f'{val:.1f}%',
-                        ha='center', va='bottom', fontsize=9)
+        ax3.set_ylabel('Average Extra Miles per Reassigned Trip', fontsize=11)
+        ax3.set_title('Operational Impact: Deadhead Travel\n(Repositioning Distance)', fontweight='bold', fontsize=12)
+        ax3.set_ylim(0, max(avg_miles) * 1.3 if max(avg_miles) > 0 else 10)
+        ax3.grid(axis='y', alpha=0.3)
         
-        # 4. Cost Breakdown (bottom left)
+        # 4. BO Optimization Progress (bottom left)
         ax4 = plt.subplot(2, 3, 4)
-        components, values = MetricsVisualizer.get_cost_breakdown(metrics)
-        if components and any(v > 0 for v in values):
-            components = [c for c, v in zip(components, values) if v > 0]
-            values = [v for v in values if v > 0]
-            ax4.pie(values, labels=components, autopct='%1.1f%%', startangle=45)
-            ax4.set_title('Cost Breakdown (Optimized)', fontsize=12, fontweight='bold')
-        else:
-            ax4.text(0.5, 0.5, 'Cost breakdown\nnot available', 
-                    ha='center', va='center', fontsize=12)
-            ax4.set_title('Cost Breakdown', fontsize=12, fontweight='bold')
         
-        # 5. BO Progress or Comparison Metrics (bottom middle)
-        ax5 = plt.subplot(2, 3, 5)
         if bo_tuner and hasattr(bo_tuner, 'trial_results') and bo_tuner.trial_results:
             trials = list(range(1, len(bo_tuner.trial_results) + 1))
-            objectives = [r.combined_objective for r in bo_tuner.trial_results]
-            ax5.plot(trials, objectives, 'b-', linewidth=2, alpha=0.7)
-            ax5.scatter(trials, objectives, c=objectives, cmap='RdYlGn_r', s=50)
-            ax5.set_xlabel('Trial Number', fontsize=11)
-            ax5.set_ylabel('Objective Value', fontsize=11)
-            ax5.set_title('Bayesian Optimization Progress', fontsize=12, fontweight='bold')
-            ax5.grid(True, alpha=0.3)
             
-            # Mark best trial
-            best_idx = np.argmin(objectives)
-            ax5.scatter(trials[best_idx], objectives[best_idx], color='gold', 
-                       s=200, marker='*', label='Best', zorder=5)
-            
-            # Add baseline objective line if available
-            if baseline and hasattr(baseline, 'combined_objective'):
-                ax5.axhline(y=baseline.combined_objective, color='red', 
-                          linestyle='--', alpha=0.5, label='Default Weights')
-            
-            ax5.legend()
-        else:
-            # Show weight comparison
-            if baseline and optimized_solution:
-                categories = ['Cost\nWeight', 'Service\nWeight', 'Compliance\nWeight']
-                
-                # Default weights (typical)
-                default_weights = [0.4, 0.3, 0.3]
-                
-                # BO-optimized weights (from best_params if available)
-                if bo_tuner and hasattr(bo_tuner, 'best_parameters'):
-                    opt_weights = [
-                        bo_tuner.best_parameters.get('cost_weight', 0.4),
-                        bo_tuner.best_parameters.get('service_weight', 0.3),
-                        bo_tuner.best_parameters.get('compliance_weight', 0.3)
-                    ]
+            # Extract objectives that aren't infinite
+            objectives = []
+            for r in bo_tuner.trial_results:
+                if r.combined_objective != float('inf') and r.feasibility_rate > 0:
+                    objectives.append(r.combined_objective)
                 else:
-                    opt_weights = default_weights
+                    objectives.append(None)
+            
+            # Plot valid points
+            valid_points = [(i+1, obj) for i, obj in enumerate(objectives) if obj is not None]
+            
+            if valid_points:
+                valid_trials, valid_objs = zip(*valid_points)
                 
-                x = np.arange(len(categories))
-                bars1 = ax5.bar(x - width/2, default_weights, width,
-                               label='Default', color='#3498db', alpha=0.8)
-                bars2 = ax5.bar(x + width/2, opt_weights, width,
-                               label='BO-Optimized', color='#27ae60', alpha=0.8)
+                # Plot line and points
+                ax4.plot(valid_trials, valid_objs, 'b-', alpha=0.4, linewidth=1.5)
+                ax4.scatter(valid_trials, valid_objs, c='blue', s=40, alpha=0.6, edgecolors='darkblue')
                 
-                ax5.set_ylabel('Weight Value', fontsize=11)
-                ax5.set_title('Optimization Weights', fontsize=12, fontweight='bold')
-                ax5.set_xticks(x)
-                ax5.set_xticklabels(categories)
-                ax5.legend()
-                ax5.set_ylim([0, 1])
-                ax5.grid(True, alpha=0.3, axis='y')
+                # Mark best trial with a star
+                best_idx = np.argmin(valid_objs)
+                ax4.scatter(valid_trials[best_idx], valid_objs[best_idx], 
+                          color='gold', s=300, marker='*', edgecolors='black', linewidth=2,
+                          label=f'Best (Trial {valid_trials[best_idx]})', zorder=5)
                 
-                # Add value labels
-                for bars in [bars1, bars2]:
-                    for bar in bars:
-                        val = bar.get_height()
-                        ax5.text(bar.get_x() + bar.get_width()/2, val, f'{val:.2f}',
-                                ha='center', va='bottom', fontsize=9)
+                # Add rolling average line for trend
+                if len(valid_objs) > 3:
+                    window = min(5, len(valid_objs) // 3)
+                    rolling_avg = pd.Series(valid_objs).rolling(window=window, min_periods=1).mean()
+                    ax4.plot(valid_trials, rolling_avg, 'r--', alpha=0.5, linewidth=2, label='Trend')
+                
+                ax4.legend(loc='best', framealpha=0.9)
+            
+            ax4.set_xlabel('Trial Number', fontsize=11)
+            ax4.set_ylabel('Combined Objective Score', fontsize=11)
+            ax4.set_title('Bayesian Optimization Convergence\n(Lower is Better)', fontweight='bold', fontsize=12)
+            ax4.grid(True, alpha=0.3)
+            
+            # Add trial success rate
+            feasible = sum(1 for r in bo_tuner.trial_results if r.feasibility_rate > 0)
+            ax4.text(0.02, 0.98, f'Feasible: {feasible}/{len(bo_tuner.trial_results)} trials',
+                    transform=ax4.transAxes, fontsize=9, va='top',
+                    bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.5))
+        else:
+            ax4.text(0.5, 0.5, 'No BO Data Available', ha='center', va='center', fontsize=14)
+            ax4.set_title('Bayesian Optimization Progress', fontweight='bold', fontsize=12)
         
-        # 6. Summary Comparison (bottom right)
+        # 5. Delay Distribution Comparison (bottom center)
+        ax5 = plt.subplot(2, 3, 5)
+        
+        # Create box plots for delay distributions
+        baseline_delays = []
+        bo_delays = []
+        
+        if baseline_solution and baseline_solution.assignments:
+            for a in baseline_solution.assignments:
+                if a.get('type') != 'outsourced':
+                    baseline_delays.append(a.get('delay_minutes', 0))
+        
+        if bo_solution and bo_solution.assignments:
+            for a in bo_solution.assignments:
+                if a.get('type') != 'outsourced':
+                    bo_delays.append(a.get('delay_minutes', 0))
+        
+        # Create box plot
+        data_to_plot = []
+        labels = []
+        
+        if baseline_delays:
+            data_to_plot.append(baseline_delays)
+            labels.append('Baseline')
+        if bo_delays:
+            data_to_plot.append(bo_delays)
+            labels.append('Optimized')
+        
+        if data_to_plot:
+            bp = ax5.boxplot(data_to_plot, labels=labels, patch_artist=True,
+                            boxprops=dict(facecolor='lightblue', alpha=0.7),
+                            medianprops=dict(color='red', linewidth=2),
+                            flierprops=dict(marker='o', markerfacecolor='red', markersize=4, alpha=0.5))
+            
+            ax5.set_ylabel('Delay Minutes per Trip', fontsize=11)
+            ax5.set_title('Delay Distribution Analysis\n(Reassigned Trips Only)', fontweight='bold', fontsize=12)
+            ax5.grid(axis='y', alpha=0.3)
+            
+            # Add mean markers
+            for i, data in enumerate(data_to_plot):
+                mean_val = np.mean(data)
+                ax5.scatter(i+1, mean_val, color='green', s=100, marker='^', zorder=5)
+                ax5.text(i+1, mean_val, f'μ={mean_val:.1f}', ha='center', va='bottom', fontsize=9)
+        else:
+            ax5.text(0.5, 0.5, 'No Delay Data', ha='center', va='center', fontsize=14)
+            ax5.set_title('Delay Distribution Analysis', fontweight='bold', fontsize=12)
+        
+        # 6. Performance Summary Table (bottom right)
         ax6 = plt.subplot(2, 3, 6)
+        ax6.axis('tight')
         ax6.axis('off')
         
-        # Build comparison summary
-        summary_lines = [
-            "OPTIMIZATION COMPARISON",
-            "=" * 25,
-            "",
-            "CP-SAT (Default Weights):",
-            f"  Cost: ${baseline.cost.total_cost:,.0f}" if baseline else "  N/A",
-            f"  Reassigned: {baseline.operational.successfully_reassigned}" if baseline else "  N/A",
-            f"  Feasibility: {baseline.operational.feasibility_rate:.1%}" if baseline else "  N/A",
-            "",
-            "CP-SAT+BO (Tuned Weights):",
-            f"  Cost: ${metrics.cost.total_cost:,.0f}",
-            f"  Reassigned: {metrics.operational.successfully_reassigned}",
-            f"  Feasibility: {metrics.operational.feasibility_rate:.1%}",
-            "",
-            "PERFORMANCE:"
+        # Calculate improvements
+        delay_improvement = baseline_metrics['avg_delay_per_reassigned'] - bo_metrics['avg_delay_per_reassigned']
+        miles_improvement = baseline_metrics['avg_miles_per_reassigned'] - bo_metrics['avg_miles_per_reassigned']
+        
+        # Create detailed comparison table
+        table_data = [
+            ['Metric', 'Baseline', 'Optimized', 'Change'],
+            ['', '', '', ''],  # Separator
+            ['PER TRIP AVERAGES:', '', '', ''],
+            ['Avg Delay (min)', 
+             f"{baseline_metrics['avg_delay_per_reassigned']:.1f}",
+             f"{bo_metrics['avg_delay_per_reassigned']:.1f}",
+             f"{-delay_improvement:+.1f}"],
+            ['Avg Extra Miles', 
+             f"{baseline_metrics['avg_miles_per_reassigned']:.1f}",
+             f"{bo_metrics['avg_miles_per_reassigned']:.1f}",
+             f"{-miles_improvement:+.1f}"],
+            ['', '', '', ''],  # Separator
+            ['TOTALS:', '', '', ''],
+            ['Total Delays (min)',
+             f"{baseline_metrics['total_delay_minutes']:.0f}",
+             f"{bo_metrics['total_delay_minutes']:.0f}",
+             f"{bo_metrics['total_delay_minutes'] - baseline_metrics['total_delay_minutes']:+.0f}"],
+            ['Total Extra Miles',
+             f"{baseline_metrics['total_deadhead_miles']:.0f}",
+             f"{bo_metrics['total_deadhead_miles']:.0f}",
+             f"{bo_metrics['total_deadhead_miles'] - baseline_metrics['total_deadhead_miles']:+.0f}"],
+            ['', '', '', ''],  # Separator
+            ['ASSIGNMENTS:', '', '', ''],
+            ['Reassigned',
+             f"{baseline_metrics['reassigned_count']}",
+             f"{bo_metrics['reassigned_count']}",
+             f"{bo_metrics['reassigned_count'] - baseline_metrics['reassigned_count']:+d}"],
+            ['Outsourced',
+             f"{baseline_metrics['outsourced_count']}",
+             f"{bo_metrics['outsourced_count']}",
+             f"{bo_metrics['outsourced_count'] - baseline_metrics['outsourced_count']:+d}"]
         ]
         
-        # Add performance assessment
-        if baseline and abs(cost_improvement) < 0.01:
-            summary_lines.extend([
-                "  ✓ Both achieved same result",
-                "  ✓ Default weights were optimal",
-                "  ✓ BO confirmed optimality"
-            ])
-        elif cost_improvement > 0:
-            summary_lines.extend([
-                f"  ✓ Cost reduced by ${cost_improvement:,.0f}",
-                f"  ✓ {cost_improvement_pct:.1f}% improvement",
-                "  ✓ BO found better weights"
-            ])
-        else:
-            summary_lines.extend([
-                "  ✓ No improvement possible",
-                "  ✓ Default weights optimal",
-                "  ✓ Problem fully solved"
-            ])
+        table = ax6.table(cellText=table_data, loc='center', cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1.1, 1.5)
         
-        summary_lines.extend([
-            "",
-            f"Total Disrupted: {len(disrupted_trips)} trips",
-            f"BO Trials Run: {len(bo_tuner.trial_results) if bo_tuner and hasattr(bo_tuner, 'trial_results') else 'N/A'}"
-        ])
+        # Style the header row
+        for i in range(4):
+            table[(0, i)].set_facecolor('#34495e')
+            table[(0, i)].set_text_props(weight='bold', color='white')
         
-        summary_text = "\n".join(summary_lines)
+        # Style section headers
+        for row_idx in [2, 6, 10]:
+            for col_idx in range(4):
+                table[(row_idx, col_idx)].set_facecolor('#95a5a6')
+                table[(row_idx, col_idx)].set_text_props(weight='bold')
         
-        ax6.text(0.1, 0.9, summary_text, transform=ax6.transAxes,
-                fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # Color code improvements in the change column
+        improvement_rows = [3, 4, 7, 8, 11, 12]  # Rows with actual metrics
+        for row_idx in improvement_rows:
+            try:
+                change_text = table_data[row_idx][3]
+                if change_text and change_text not in ['', 'Change']:
+                    change_val = float(change_text)
+                    
+                    # For delays and miles, negative is better (reduction)
+                    # For reassigned, positive is better (more internal handling)
+                    # For outsourced, negative is better (less outsourcing)
+                    if 'Delay' in table_data[row_idx][0] or 'Miles' in table_data[row_idx][0]:
+                        color = '#d4f1d4' if change_val <= 0 else '#ffd4d4'
+                    elif 'Reassigned' in table_data[row_idx][0]:
+                        color = '#d4f1d4' if change_val >= 0 else '#ffd4d4'
+                    elif 'Outsourced' in table_data[row_idx][0]:
+                        color = '#d4f1d4' if change_val <= 0 else '#ffd4d4'
+                    else:
+                        color = 'white'
+                    
+                    table[(row_idx, 3)].set_facecolor(color)
+            except (ValueError, IndexError):
+                pass
         
-        plt.suptitle('Dynamic Trip Rescheduling - CP-SAT Baseline vs BO Optimization', 
-                    fontsize=14, fontweight='bold', y=1.02)
-        plt.tight_layout()
+        ax6.set_title('Performance Metrics Summary', fontweight='bold', fontsize=12, pad=20)
+        
+        # Add interpretation text below the figure
+        fig.text(0.5, 0.02, 
+                f'Key Insight: {"✓ Win-Win" if delay_improvement > 0 and miles_improvement > 0 else "⚖ Trade-off" if (delay_improvement > 0) != (miles_improvement > 0) else "≈ Similar"} | ' +
+                f'Avg Delay {"↓" if delay_improvement > 0 else "↑" if delay_improvement < 0 else "="}{abs(delay_improvement):.1f} min | ' +
+                f'Avg Miles {"↓" if miles_improvement > 0 else "↑" if miles_improvement < 0 else "="}{abs(miles_improvement):.1f} mi',
+                ha='center', fontsize=11, weight='bold',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+        
+        # Overall title
+        plt.suptitle('Trip Rescheduling Optimization: Operational Performance Comparison', 
+                    fontsize=16, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0.04, 1, 0.96])
         
         return fig
     
     @staticmethod
-    def create_results_summary_table(metrics, cost_reduction, cost_reduction_pct, solution) -> pd.DataFrame:
+    def create_simple_summary(baseline_solution, bo_solution, disrupted_trips) -> pd.DataFrame:
         """
-        Create a clean summary table of results.
-        
-        Returns:
-            DataFrame with metrics summary
+        Create a simple summary DataFrame focusing on operational metrics.
         """
-        avg_deadhead = MetricsVisualizer.get_average_deadhead(metrics)
+        baseline_metrics = MetricsVisualizer.extract_operational_metrics(baseline_solution)
+        bo_metrics = MetricsVisualizer.extract_operational_metrics(bo_solution)
         
-        results = {
+        summary_data = {
             'Metric': [
-                'Trips Reassigned',
-                'Trips Outsourced', 
-                'Feasibility Rate',
-                'Total Cost',
-                'Cost Savings',
-                'Average Deadhead',
-                'On-Time Rate',
-                'Solve Time'
+                'Total Disrupted Trips',
+                'Successfully Reassigned',
+                'Outsourced',
+                'Average Delay per Reassigned Trip (min)',
+                'Average Extra Miles per Reassigned Trip',
+                'Total Delay Minutes',
+                'Total Extra Miles',
+                'Trips with Zero Delay',
+                'Trips with Delays',
+                'Maximum Single Delay (min)'
             ],
-            'Value': [
-                f"{metrics.operational.successfully_reassigned}",
-                f"{metrics.operational.outsourced}",
-                f"{metrics.operational.feasibility_rate:.1%}",
-                f"${metrics.cost.total_cost:,.0f}",
-                f"${cost_reduction:,.0f} ({cost_reduction_pct:.1f}%)",
-                avg_deadhead,
-                f"{metrics.sla.on_time_rate:.1%}",
-                f"{solution.solve_time_seconds:.1f} sec"
+            'Baseline': [
+                len(disrupted_trips),
+                baseline_metrics['reassigned_count'],
+                baseline_metrics['outsourced_count'],
+                f"{baseline_metrics['avg_delay_per_reassigned']:.1f}",
+                f"{baseline_metrics['avg_miles_per_reassigned']:.1f}",
+                f"{baseline_metrics['total_delay_minutes']:.0f}",
+                f"{baseline_metrics['total_deadhead_miles']:.0f}",
+                baseline_metrics['trips_with_zero_delay'],
+                baseline_metrics['trips_with_delays'],
+                f"{baseline_metrics['max_delay']:.0f}"
+            ],
+            'Optimized (BO)': [
+                len(disrupted_trips),
+                bo_metrics['reassigned_count'],
+                bo_metrics['outsourced_count'],
+                f"{bo_metrics['avg_delay_per_reassigned']:.1f}",
+                f"{bo_metrics['avg_miles_per_reassigned']:.1f}",
+                f"{bo_metrics['total_delay_minutes']:.0f}",
+                f"{bo_metrics['total_deadhead_miles']:.0f}",
+                bo_metrics['trips_with_zero_delay'],
+                bo_metrics['trips_with_delays'],
+                f"{bo_metrics['max_delay']:.0f}"
             ]
         }
         
-        return pd.DataFrame(results)
+        return pd.DataFrame(summary_data)

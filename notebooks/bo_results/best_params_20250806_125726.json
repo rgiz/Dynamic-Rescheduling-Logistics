@@ -1,0 +1,7 @@
+{
+  "cost_weight": 0.8014227937836712,
+  "service_weight": 0.28522004216741725,
+  "max_cascade_depth": 2,
+  "max_deadhead_minutes": 107.90140384938076,
+  "max_delay_minutes": 88.0675279854205
+}
