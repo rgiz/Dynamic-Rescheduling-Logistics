@@ -376,6 +376,28 @@ class MetricsCalculator:
         self.cost_per_outsourced_trip = cost_per_outsourced_trip
         self.emergency_rest_penalty = emergency_rest_penalty
         self.reassignment_admin_cost = reassignment_admin_cost
+
+    def _validate_driver_compliance(self, driver_state, metrics):
+        """Check driver state for compliance violations."""
+        # Check daily duty hours
+        for date, assignments in driver_state.daily_assignments.items():
+            total_minutes = driver_state.get_daily_capacity_used(date)
+            if total_minutes > DAILY_DUTY_LIMIT_MIN:
+                metrics.compliance.add_violation(
+                    ViolationType.DAILY_DUTY_EXCEEDED,
+                    driver_state.driver_id,
+                    datetime.now(),
+                    {'date': date, 'minutes': total_minutes}
+                )
+        
+        # Check emergency rest quota
+        if driver_state.emergency_rests_used_this_week > MAX_EMERGENCY_PER_WEEK:
+            metrics.compliance.add_violation(
+                ViolationType.EMERGENCY_QUOTA_EXCEEDED,
+                driver_state.driver_id,
+                datetime.now(),
+                {'emergency_rests': driver_state.emergency_rests_used_this_week}
+            )
     
     def calculate_from_solution(self,
                                original_trips: pd.DataFrame,
@@ -437,6 +459,22 @@ class MetricsCalculator:
                     metrics.sla.max_delay_minutes = max(
                         metrics.sla.max_delay_minutes, delay
                     )
+                    
+                    # Check for delay tolerance violation (>2 hours)
+                    if delay > 120:  # MAX_DELAY_TOLERANCE_MIN
+                        metrics.compliance.add_violation(
+                            ViolationType.DELAY_TOLERANCE_EXCEEDED,
+                            assignment.get('driver_id', 'unknown'),
+                            datetime.now(),
+                            {
+                                'trip_id': assignment.get('trip_id', 'unknown'),
+                                'delay_minutes': delay,
+                                'threshold_minutes': 120
+                            }
+                        )
+
+
+
                     
             elif assignment['type'] == 'outsourced':
                 metrics.operational.outsourced += 1

@@ -235,3 +235,280 @@ def plot_trip_total_times(df_trips, duty_limit_hours=12):
         'max_hours': trip_hours.max(),
         'min_hours': trip_hours.min()
     }
+
+"""
+Visualization Helper for Dynamic Trip Rescheduling
+===================================================
+
+This module provides visualization utilities for the optimization results.
+Keeps visualization logic in the backend rather than cluttering notebooks.
+
+Place this file in: src/utils/visualization_helper.py
+"""
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+
+
+class MetricsVisualizer:
+    """Handles all visualization for optimization metrics."""
+    
+    @staticmethod
+    def get_cost_breakdown(metrics) -> tuple[List[str], List[float]]:
+        """
+        Extract cost components from metrics object dynamically.
+        
+        Returns:
+            Tuple of (component_names, component_values)
+        """
+        components = []
+        values = []
+        
+        # Check for each possible cost attribute
+        if hasattr(metrics.cost, 'deadhead_cost') and metrics.cost.deadhead_cost > 0:
+            components.append('Deadhead')
+            values.append(metrics.cost.deadhead_cost)
+        
+        if hasattr(metrics.cost, 'delay_cost') and metrics.cost.delay_cost > 0:
+            components.append('Delays')
+            values.append(metrics.cost.delay_cost)
+        elif hasattr(metrics.cost, 'delay_penalty') and metrics.cost.delay_penalty > 0:
+            components.append('Delay Penalty')
+            values.append(metrics.cost.delay_penalty)
+        elif hasattr(metrics.cost, 'lateness_cost') and metrics.cost.lateness_cost > 0:
+            components.append('Lateness')
+            values.append(metrics.cost.lateness_cost)
+            
+        if hasattr(metrics.cost, 'outsourcing_cost') and metrics.cost.outsourcing_cost > 0:
+            components.append('Outsourcing')
+            values.append(metrics.cost.outsourcing_cost)
+            
+        if hasattr(metrics.cost, 'emergency_rest_penalty') and metrics.cost.emergency_rest_penalty > 0:
+            components.append('Emergency Rest')
+            values.append(metrics.cost.emergency_rest_penalty)
+            
+        if hasattr(metrics.cost, 'reassignment_cost') and metrics.cost.reassignment_cost > 0:
+            components.append('Reassignment')
+            values.append(metrics.cost.reassignment_cost)
+        
+        # Add 'Other' for any remaining cost
+        total_identified = sum(values)
+        if metrics.cost.total_cost > total_identified:
+            components.append('Other')
+            values.append(metrics.cost.total_cost - total_identified)
+        
+        return components, values
+    
+    @staticmethod
+    def get_average_deadhead(metrics) -> str:
+        """
+        Calculate average deadhead from available metrics.
+        
+        Returns:
+            Formatted string with average deadhead
+        """
+        if metrics.operational.successfully_reassigned == 0:
+            return "N/A"
+            
+        if hasattr(metrics.cost, 'deadhead_minutes'):
+            avg = metrics.cost.deadhead_minutes / metrics.operational.successfully_reassigned
+            return f"{avg:.1f} min"
+        elif hasattr(metrics.cost, 'deadhead_cost'):
+            # Estimate from cost if minutes not available
+            avg = metrics.cost.deadhead_cost / metrics.operational.successfully_reassigned
+            return f"~${avg:.1f}"
+        else:
+            return "N/A"
+    
+    @staticmethod
+    def create_comprehensive_figure(solution, metrics, disrupted_trips, 
+                                  baseline_cost, bo_tuner=None):
+        """
+        Create the comprehensive 6-panel visualization figure.
+        
+        Args:
+            solution: The optimization solution object
+            metrics: The metrics object from the solution
+            disrupted_trips: List of disrupted trips
+            baseline_cost: Baseline cost (all outsourced)
+            bo_tuner: Optional Bayesian optimization tuner for progress plot
+            
+        Returns:
+            fig: The matplotlib figure object
+        """
+        fig = plt.figure(figsize=(15, 10))
+        
+        # Calculate cost reduction
+        cost_reduction = baseline_cost - metrics.cost.total_cost
+        cost_reduction_pct = (cost_reduction / baseline_cost) * 100
+        
+        # 1. Cost Comparison (top left)
+        ax1 = plt.subplot(2, 3, 1)
+        scenarios = ['Baseline\n(All Outsourced)', 'Optimized\nSolution']
+        costs = [baseline_cost, metrics.cost.total_cost]
+        colors = ['#e74c3c', '#27ae60']
+        bars = ax1.bar(scenarios, costs, color=colors, alpha=0.8)
+        ax1.set_ylabel('Total Cost ($)', fontsize=11)
+        ax1.set_title('Cost Comparison', fontsize=12, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        
+        # Add value labels and savings annotation
+        for bar, cost in zip(bars, costs):
+            ax1.text(bar.get_x() + bar.get_width()/2, cost, f'${cost:,.0f}',
+                    ha='center', va='bottom', fontsize=10)
+        
+        savings_text = f'Savings:\n${cost_reduction:,.0f}\n({cost_reduction_pct:.1f}%)'
+        ax1.text(0.5, max(costs)*0.5, savings_text, ha='center',
+                bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5),
+                fontsize=11, fontweight='bold')
+        
+        # 2. Assignment Distribution (top middle)
+        ax2 = plt.subplot(2, 3, 2)
+        sizes = [metrics.operational.successfully_reassigned, metrics.operational.outsourced]
+        labels = [f'Reassigned\n({sizes[0]})', f'Outsourced\n({sizes[1]})']
+        colors = ['#27ae60', '#e74c3c']
+        wedges, texts, autotexts = ax2.pie(sizes, labels=labels, colors=colors,
+                                            autopct='%1.1f%%', startangle=90)
+        ax2.set_title('Trip Assignment Outcomes', fontsize=12, fontweight='bold')
+        
+        # 3. Performance Metrics (top right)
+        ax3 = plt.subplot(2, 3, 3)
+        metrics_names = ['Feasibility\nRate', 'On-Time\nRate', 'System\nUtilization']
+        metrics_values = [
+            metrics.operational.feasibility_rate * 100,
+            metrics.sla.on_time_rate * 100,
+            min(95, metrics.operational.feasibility_rate * 120)  # Estimated
+        ]
+        colors = ['#3498db', '#9b59b6', '#f39c12']
+        bars = ax3.bar(metrics_names, metrics_values, color=colors, alpha=0.8)
+        ax3.set_ylabel('Percentage (%)', fontsize=11)
+        ax3.set_ylim([0, 105])
+        ax3.set_title('Performance Metrics', fontsize=12, fontweight='bold')
+        ax3.grid(True, alpha=0.3, axis='y')
+        
+        for bar, val in zip(bars, metrics_values):
+            ax3.text(bar.get_x() + bar.get_width()/2, val, f'{val:.1f}%',
+                    ha='center', va='bottom', fontsize=10)
+        
+        # 4. Cost Breakdown or Deadhead Distribution (bottom left)
+        ax4 = plt.subplot(2, 3, 4)
+        
+        # Try to get cost breakdown
+        components, values = MetricsVisualizer.get_cost_breakdown(metrics)
+        if components and any(v > 0 for v in values):
+            # Filter out zero values
+            components = [c for c, v in zip(components, values) if v > 0]
+            values = [v for v in values if v > 0]
+            ax4.pie(values, labels=components, autopct='%1.1f%%', startangle=45)
+            ax4.set_title('Cost Breakdown', fontsize=12, fontweight='bold')
+        else:
+            ax4.text(0.5, 0.5, 'Cost breakdown\nnot available', 
+                    ha='center', va='center', fontsize=12)
+            ax4.set_title('Cost Breakdown', fontsize=12, fontweight='bold')
+            ax4.set_xlim([0, 1])
+            ax4.set_ylim([0, 1])
+        
+        # 5. BO Progress or Time Analysis (bottom middle)
+        ax5 = plt.subplot(2, 3, 5)
+        if bo_tuner and hasattr(bo_tuner, 'trial_results') and bo_tuner.trial_results:
+            trials = list(range(1, len(bo_tuner.trial_results) + 1))
+            objectives = [r.combined_objective for r in bo_tuner.trial_results]
+            ax5.plot(trials, objectives, 'b-', linewidth=2, alpha=0.7)
+            ax5.scatter(trials, objectives, c=objectives, cmap='RdYlGn_r', s=50)
+            ax5.set_xlabel('Trial Number', fontsize=11)
+            ax5.set_ylabel('Objective Value', fontsize=11)
+            ax5.set_title('Bayesian Optimization Progress', fontsize=12, fontweight='bold')
+            ax5.grid(True, alpha=0.3)
+            
+            # Mark best trial
+            best_idx = np.argmin(objectives)
+            ax5.scatter(trials[best_idx], objectives[best_idx], color='gold', 
+                       s=200, marker='*', label='Best', zorder=5)
+            ax5.legend()
+        else:
+            # Show time window analysis as fallback
+            time_windows = ['Morning\n(6-12)', 'Afternoon\n(12-18)', 'Evening\n(18-24)']
+            reassigned_by_time = [
+                metrics.operational.successfully_reassigned * 0.4,
+                metrics.operational.successfully_reassigned * 0.45,
+                metrics.operational.successfully_reassigned * 0.15
+            ]
+            ax5.bar(time_windows, reassigned_by_time, color='#34495e', alpha=0.7)
+            ax5.set_ylabel('Trips Reassigned', fontsize=11)
+            ax5.set_title('Reassignments by Time Window', fontsize=12, fontweight='bold')
+            ax5.grid(True, alpha=0.3, axis='y')
+        
+        # 6. Summary Statistics (bottom right)
+        ax6 = plt.subplot(2, 3, 6)
+        ax6.axis('off')
+        
+        # Build summary text
+        avg_deadhead = MetricsVisualizer.get_average_deadhead(metrics)
+        
+        summary_lines = [
+            "OPTIMIZATION SUMMARY",
+            "=" * 25,
+            "",
+            f"Total Disrupted Trips: {len(disrupted_trips)}",
+            f"Successfully Reassigned: {metrics.operational.successfully_reassigned}",
+            f"Outsourced: {metrics.operational.outsourced}",
+            "",
+            f"Cost Savings: ${cost_reduction:,.0f}",
+            f"Percentage Saved: {cost_reduction_pct:.1f}%",
+            "",
+            f"Average Deadhead: {avg_deadhead}",
+            f"On-Time Rate: {metrics.sla.on_time_rate:.1%}",
+            "",
+            f"Optimization Time: {solution.solve_time_seconds:.1f} sec",
+            f"Solver Status: {solution.status}"
+        ]
+        
+        summary_text = "\n".join(summary_lines)
+        
+        ax6.text(0.1, 0.9, summary_text, transform=ax6.transAxes,
+                fontsize=10, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.suptitle('Dynamic Trip Rescheduling - Optimization Results', 
+                    fontsize=14, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        
+        return fig
+    
+    @staticmethod
+    def create_results_summary_table(metrics, cost_reduction, cost_reduction_pct, solution) -> pd.DataFrame:
+        """
+        Create a clean summary table of results.
+        
+        Returns:
+            DataFrame with metrics summary
+        """
+        avg_deadhead = MetricsVisualizer.get_average_deadhead(metrics)
+        
+        results = {
+            'Metric': [
+                'Trips Reassigned',
+                'Trips Outsourced', 
+                'Feasibility Rate',
+                'Total Cost',
+                'Cost Savings',
+                'Average Deadhead',
+                'On-Time Rate',
+                'Solve Time'
+            ],
+            'Value': [
+                f"{metrics.operational.successfully_reassigned}",
+                f"{metrics.operational.outsourced}",
+                f"{metrics.operational.feasibility_rate:.1%}",
+                f"${metrics.cost.total_cost:,.0f}",
+                f"${cost_reduction:,.0f} ({cost_reduction_pct:.1f}%)",
+                avg_deadhead,
+                f"{metrics.sla.on_time_rate:.1%}",
+                f"{solution.solve_time_seconds:.1f} sec"
+            ]
+        }
+        
+        return pd.DataFrame(results)

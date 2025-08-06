@@ -1,0 +1,6 @@
+{
+  "cost_weight": 0.33783569647976464,
+  "service_weight": 0.4610347280863105,
+  "compliance_weight": 0.5505792623631588,
+  "max_cascade_depth": 2
+}
