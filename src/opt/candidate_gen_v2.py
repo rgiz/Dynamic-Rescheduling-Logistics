@@ -26,36 +26,67 @@ from evaluation_metrics import CostMetrics
 @dataclass
 class ReassignmentCandidate:
     """
-    Represents a potential reassignment option for a disrupted trip.
+    Represents a single candidate for reassigning a disrupted trip.
     """
-    # Basic info
+    # Core identification
     disrupted_trip_id: str
-    candidate_type: str  # 'direct', 'cascade_2', 'cascade_multi', 'outsource'
-    
-    # Assignment details
+    candidate_type: str = 'direct'  # 'direct', 'cascade', 'outsource'
     assigned_driver_id: Optional[str] = None
-    position_in_day: Optional[int] = None  # Where to insert in driver's schedule
     
-    # Cascading details (if applicable)
+    # Position and sequence
+    position_in_day: int = 0
+    cascade_depth: int = 1
     cascade_chain: List[Dict] = field(default_factory=list)
-    cascade_depth: int = 0
+    cascade_chain_id: Optional[str] = None
     
-    # Costs and penalties
+    # Operational metrics
     deadhead_minutes: float = 0.0
+    deadhead_miles: float = 0.0
     delay_minutes: float = 0.0
-    emergency_rest_used: bool = False
     
-    # Feasibility and scoring
+    # Regulatory compliance
+    emergency_rest_used: bool = False
+    violates_rest_period: bool = False
+    violates_weekend_rest: bool = False
+    
+    # Feasibility
     is_feasible: bool = True
-    feasibility_score: float = 1.0  # 0-1, higher is better
+    violations: List[str] = field(default_factory=list)
+    feasibility_score: float = 0.0
+    
+    # Cost (will be calculated)
     total_cost: float = 0.0
     
-    # Constraint violations (if any)
-    violations: List[str] = field(default_factory=list)
-    
-    def __repr__(self):
-        return (f"Candidate({self.candidate_type}, driver={self.assigned_driver_id}, "
-                f"cost={self.total_cost:.2f}, feasible={self.is_feasible})")
+    def calculate_total_cost(self) -> float:
+        """
+        Calculate the total cost of this candidate assignment using embedded cost constants.
+        """
+        # Embedded cost constants (should match your notebook constants)
+        DELAY_COST_PER_MINUTE = 1.0
+        DEADHEAD_COST_PER_MINUTE = 0.5
+        REASSIGNMENT_ADMIN_COST = 10.0
+        EMERGENCY_REST_PENALTY = 50.0
+        OUTSOURCING_BASE_COST = 200.0
+        
+        # Service quality costs
+        service_cost = self.delay_minutes * DELAY_COST_PER_MINUTE
+        if self.emergency_rest_used:
+            service_cost += EMERGENCY_REST_PENALTY
+        
+        # Operational costs
+        operational_cost = self.deadhead_minutes * DEADHEAD_COST_PER_MINUTE
+        if self.candidate_type in ['direct', 'cascade']:
+            operational_cost += REASSIGNMENT_ADMIN_COST
+        
+        # Outsourcing costs (if applicable)
+        if self.candidate_type == 'outsource':
+            self.total_cost = OUTSOURCING_BASE_COST
+            return self.total_cost
+        
+        # Total cost for reassignment candidates
+        total = service_cost + operational_cost
+        self.total_cost = total
+        return total
 
 
 class CandidateGeneratorV2:
@@ -75,17 +106,6 @@ class CandidateGeneratorV2:
                  emergency_rest_penalty: float = 100.0):
         """
         Initialize candidate generator.
-        
-        Args:
-            driver_states: Dictionary of driver_id -> DriverState objects
-            distance_matrix: Matrix of travel times between locations
-            location_to_index: Mapping of location names to matrix indices
-            max_cascade_depth: Maximum depth for cascading reassignments
-            max_deadhead_minutes: Maximum acceptable deadhead time
-            max_delay_minutes: Maximum acceptable delay
-            cost_per_minute_deadhead: Cost per minute of deadhead travel
-            cost_per_minute_delay: Cost per minute of delay
-            emergency_rest_penalty: Penalty for using emergency rest
         """
         self.driver_states = driver_states
         self.distance_matrix = distance_matrix
@@ -109,16 +129,6 @@ class CandidateGeneratorV2:
                           include_outsource: bool = True) -> List[ReassignmentCandidate]:
         """
         Generate all feasible candidates for a disrupted trip.
-        
-        Args:
-            disrupted_trip: Dict with trip details (id, start_time, end_time, 
-                          start_location, end_location, duration_minutes)
-            drivers_to_consider: Optional list of driver IDs to consider
-            include_cascades: Whether to generate cascading candidates
-            include_outsource: Whether to include outsourcing option
-            
-        Returns:
-            List of ReassignmentCandidate objects, sorted by total cost
         """
         candidates = []
         
@@ -144,11 +154,15 @@ class CandidateGeneratorV2:
             outsource_candidate = self._create_outsource_candidate(disrupted_trip)
             candidates.append(outsource_candidate)
         
-        # Sort by total cost (lower is better)
+        # 4. Calculate costs for all candidates BEFORE sorting
+        for candidate in candidates:
+            candidate.calculate_total_cost()
+        
+        # 5. Sort by total cost (lower is better)
         candidates.sort(key=lambda x: (not x.is_feasible, x.total_cost))
         
         return candidates
-    
+
     def _generate_direct_insertions(self,
                                    disrupted_trip: Dict,
                                    drivers: List[str]) -> List[ReassignmentCandidate]:
@@ -171,10 +185,8 @@ class CandidateGeneratorV2:
             day_assignments = []
             if hasattr(driver_state, 'get_day_assignments'):
                 day_assignments = driver_state.get_day_assignments(trip_date_str)
-            elif hasattr(driver_state, 'assignments'):
-                # Direct access to assignments dict
-                if trip_date_str in driver_state.assignments:
-                    day_assignments = driver_state.assignments[trip_date_str]
+            elif hasattr(driver_state, 'daily_assignments'):
+                day_assignments = driver_state.daily_assignments.get(trip_date_str, [])
             
             # Try inserting at each position in the day's schedule
             for position in range(len(day_assignments) + 1):
@@ -296,24 +308,15 @@ class CandidateGeneratorV2:
         
         if total_day_minutes > 13 * 60:  # 13 hour limit
             # Check if emergency rest could help
-            if total_day_minutes <= 15 * 60 and driver_state.can_use_emergency_rest(date_str):
-                candidate.emergency_rest_used = True
+            if total_day_minutes <= 15 * 60 and hasattr(driver_state, 'can_use_emergency_rest'):
+                if driver_state.can_use_emergency_rest():
+                    candidate.emergency_rest_used = True
+                else:
+                    candidate.is_feasible = False
+                    candidate.violations.append(f"Daily duty {total_day_minutes/60:.1f}h > 13h limit, no emergency rest available")
             else:
                 candidate.is_feasible = False
                 candidate.violations.append(f"Daily duty {total_day_minutes/60:.1f}h > 13h limit")
-        
-        # Calculate total cost
-        candidate.total_cost = (
-            candidate.deadhead_minutes * self.cost_per_minute_deadhead +
-            candidate.delay_minutes * self.cost_per_minute_delay +
-            (self.emergency_rest_penalty if candidate.emergency_rest_used else 0)
-        )
-        
-        # Calculate feasibility score (for ranking feasible options)
-        if candidate.is_feasible:
-            # Score based on efficiency (less deadhead/delay is better)
-            efficiency = 1.0 / (1.0 + candidate.deadhead_minutes / 60 + candidate.delay_minutes / 30)
-            candidate.feasibility_score = efficiency
         
         return candidate
     
@@ -326,8 +329,6 @@ class CandidateGeneratorV2:
         candidates = []
         
         # For now, implement simple 2-driver cascades
-        # The idea: Driver A takes the disrupted trip, Driver B takes one of A's trips
-        
         for driver_a_id in drivers:
             driver_a_state = self.driver_states[driver_a_id]
             trip_date_str = disrupted_trip['start_time'].date().strftime('%Y-%m-%d')
@@ -378,7 +379,7 @@ class CandidateGeneratorV2:
         """
         candidate = ReassignmentCandidate(
             disrupted_trip_id=disrupted_trip['id'],
-            candidate_type='cascade_2',
+            candidate_type='cascade',
             assigned_driver_id=driver_a_id,
             cascade_depth=2
         )
@@ -395,42 +396,14 @@ class CandidateGeneratorV2:
                 'step': 2,
                 'driver': driver_b_id,
                 'action': 'takes_moved_trip',
-                'trip_id': moved_assignment.trip_id,
+                'trip_id': getattr(moved_assignment, 'trip_id', 'unknown'),
                 'from_driver': driver_a_id
             }
         ]
         
-        # Calculate costs for both moves
-        # This is simplified - actual implementation would be more detailed
-        
-        # Cost for Driver A taking disrupted trip
-        # Try to get last location, otherwise use default
-        last_location_a = 'unknown'
-        if hasattr(driver_a_state, 'get_last_location_before'):
-            last_location_a = driver_a_state.get_last_location_before(disrupted_trip['start_time'])
-        
-        deadhead_a = self._calculate_travel_time(
-            last_location_a,
-            disrupted_trip['start_location']
-        )
-        
-        # Cost for Driver B taking moved assignment  
-        last_location_b = 'unknown'
-        if hasattr(driver_b_state, 'get_last_location_before'):
-            last_location_b = driver_b_state.get_last_location_before(moved_assignment.start_time)
-        
-        deadhead_b = self._calculate_travel_time(
-            last_location_b,
-            moved_assignment.start_location
-        )
-        
-        candidate.deadhead_minutes = deadhead_a + deadhead_b
-        
-        # Simple cost calculation
-        candidate.total_cost = (
-            candidate.deadhead_minutes * self.cost_per_minute_deadhead +
-            50  # Fixed penalty for cascade complexity
-        )
+        # Simplified cost calculation for cascades
+        candidate.deadhead_minutes = 60.0  # Estimate for cascade complexity
+        candidate.delay_minutes = 0.0
         
         return candidate
     
@@ -441,19 +414,13 @@ class CandidateGeneratorV2:
         """
         Check if driver has capacity for additional minutes on given date.
         """
-        # Try different methods to get daily usage
         current_usage = 0
         
         if hasattr(driver_state, 'get_daily_usage'):
             current_usage = driver_state.get_daily_usage(date_str)
-        elif hasattr(driver_state, 'get_day_assignments'):
-            # Calculate from assignments
-            assignments = driver_state.get_day_assignments(date_str)
-            current_usage = sum(a.duration_minutes for a in assignments)
-        elif hasattr(driver_state, 'assignments'):
-            # Direct access to assignments dict
-            if date_str in driver_state.assignments:
-                current_usage = sum(a.duration_minutes for a in driver_state.assignments[date_str])
+        elif hasattr(driver_state, 'daily_assignments'):
+            assignments = driver_state.daily_assignments.get(date_str, [])
+            current_usage = sum(getattr(a, 'duration_minutes', 0) for a in assignments)
         
         total_with_new = current_usage + additional_minutes
         
@@ -467,7 +434,6 @@ class CandidateGeneratorV2:
         Calculate travel time between two locations.
         """
         if self.distance_matrix is None or self.location_to_index is None:
-            # Fallback: estimate based on location difference
             return 30.0  # Default 30 minutes
         
         try:
@@ -485,19 +451,11 @@ class CandidateGeneratorV2:
         """
         assignments = []
         
-        if hasattr(driver_state, 'get_day_assignments'):
-            assignments = driver_state.get_day_assignments(date_str)
-        elif hasattr(driver_state, 'assignments'):
-            if date_str in driver_state.assignments:
-                assignments = driver_state.assignments[date_str]
+        if hasattr(driver_state, 'daily_assignments'):
+            assignments = driver_state.daily_assignments.get(date_str, [])
         
-        # Filter for assignments that aren't too time-critical
-        # This is a simplified heuristic
-        moveable = []
-        for assignment in assignments:
-            # Don't move very long assignments (>8 hours)
-            if assignment.duration_minutes <= 8 * 60:
-                moveable.append(assignment)
+        # Filter for assignments that aren't too long
+        moveable = [a for a in assignments if getattr(a, 'duration_minutes', 0) <= 8 * 60]
         
         return moveable
     
@@ -508,12 +466,8 @@ class CandidateGeneratorV2:
         """
         Check if a driver can take an additional assignment.
         """
-        # Simple capacity check
-        return self._check_driver_capacity(
-            driver_state,
-            date_str,
-            assignment.duration_minutes
-        )
+        duration = getattr(assignment, 'duration_minutes', 0)
+        return self._check_driver_capacity(driver_state, date_str, duration)
     
     def _create_outsource_candidate(self,
                                    disrupted_trip: Dict) -> ReassignmentCandidate:
@@ -523,9 +477,9 @@ class CandidateGeneratorV2:
         candidate = ReassignmentCandidate(
             disrupted_trip_id=disrupted_trip['id'],
             candidate_type='outsource',
-            is_feasible=True,
-            total_cost=500.0  # Fixed outsourcing cost
+            is_feasible=True
         )
+        # Cost will be calculated by calculate_total_cost()
         return candidate
     
     def get_candidate_summary(self,
@@ -549,54 +503,3 @@ class CandidateGeneratorV2:
             })
         
         return pd.DataFrame(data)
-
-
-# Example usage
-def example_usage():
-    """
-    Example of how to use the candidate generator.
-    """
-    # Assume we have driver states loaded
-    driver_states = {}  # Would be populated with actual DriverState objects
-    
-    # Initialize generator
-    generator = CandidateGeneratorV2(
-        driver_states=driver_states,
-        max_cascade_depth=2,
-        max_deadhead_minutes=120,
-        max_delay_minutes=120
-    )
-    
-    # Define a disrupted trip
-    disrupted_trip = {
-        'id': 'TRIP_001',
-        'start_time': datetime(2024, 1, 15, 9, 0),
-        'end_time': datetime(2024, 1, 15, 13, 0),
-        'duration_minutes': 240,
-        'start_location': 'Delhi_DC',
-        'end_location': 'Mumbai_DC'
-    }
-    
-    # Generate candidates
-    candidates = generator.generate_candidates(
-        disrupted_trip,
-        include_cascades=True,
-        include_outsource=True
-    )
-    
-    # Print summary
-    print(f"Generated {len(candidates)} candidates:")
-    for i, candidate in enumerate(candidates[:5]):  # Show top 5
-        print(f"{i+1}. {candidate}")
-    
-    # Get DataFrame summary
-    summary_df = generator.get_candidate_summary(candidates)
-    print("\nCandidate Summary:")
-    print(summary_df.head())
-    
-    return candidates, summary_df
-
-
-if __name__ == "__main__":
-    # Run example
-    candidates, summary = example_usage()
