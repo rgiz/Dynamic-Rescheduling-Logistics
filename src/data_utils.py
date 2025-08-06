@@ -107,36 +107,134 @@ def group_by_route(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_or_generate_coordinates(project_root: Path = None) -> pd.DataFrame:
+    """
+    Load existing coordinates or generate them with PROPER SCALING.
+    Fixed version that calibrates MDS coordinates to real distances.
+    """
     if project_root is None:
         project_root = Path.cwd().parent  # assumes we're inside /notebooks/
 
     coord_path = project_root / "data" / "processed" / "center_coordinates.csv"
 
     if coord_path.exists():
+        print(f"📍 Loading existing coordinates from {coord_path}")
         return pd.read_csv(coord_path)
 
+    print(f"🗺️ Generating coordinates with PROPER SCALING...")
+    
     # Load trips to build from scratch
-    df = pd.read_csv(project_root / "data" / "processed" / "trips.csv")
-    df_pairs = df[['source_center', 'destination_center', 'segment_osrm_distance']]
+    trips_path = project_root / "data" / "processed" / "trips.csv"
+    if not trips_path.exists():
+        raise FileNotFoundError(f"Trips file not found: {trips_path}")
+        
+    df = pd.read_csv(trips_path)
+    
+    # Extract source-destination-distance triples
+    df_pairs = df[['source_center', 'destination_center', 'segment_osrm_distance']].copy()
     df_pairs = df_pairs[df_pairs['source_center'] != df_pairs['destination_center']]
 
+    print(f"   Loaded {len(df_pairs)} location pairs")
+    print(f"   Distance range: {df_pairs['segment_osrm_distance'].min():.1f} - {df_pairs['segment_osrm_distance'].max():.1f} km")
+
+    # Aggregate: median distance between source-destination pairs
     pair_medians = df_pairs.groupby(['source_center', 'destination_center'])['segment_osrm_distance'].median().reset_index()
+    
     locations = sorted(set(pair_medians['source_center']).union(set(pair_medians['destination_center'])))
     loc_idx = {loc: i for i, loc in enumerate(locations)}
     n = len(locations)
 
-    matrix = np.full((n, n), np.nan)
+    print(f"   Found {n} unique locations")
+
+    # Build symmetric distance matrix (in REAL kilometers)
+    real_distance_matrix = np.full((n, n), np.nan)
     for _, row in pair_medians.iterrows():
         i, j = loc_idx[row['source_center']], loc_idx[row['destination_center']]
-        matrix[i, j] = matrix[j, i] = row['segment_osrm_distance']
+        distance_km = row['segment_osrm_distance']
+        real_distance_matrix[i, j] = distance_km
+        real_distance_matrix[j, i] = distance_km
 
-    np.fill_diagonal(matrix, 0)
-    matrix = np.nan_to_num(matrix, nan=np.nanmax(matrix))
+    # Fill diagonal and replace NaNs
+    np.fill_diagonal(real_distance_matrix, 0)
+    max_distance = np.nanmax(real_distance_matrix)
+    real_distance_matrix = np.nan_to_num(real_distance_matrix, nan=max_distance)
 
-    coords = MDS(n_components=2, dissimilarity='precomputed', random_state=42).fit_transform(matrix)
-    df_coords = pd.DataFrame(coords, columns=["x", "y"])
+    print(f"   Built real distance matrix with max distance: {max_distance:.1f} km")
+
+    # Apply MDS to get coordinates in arbitrary units
+    from sklearn.manifold import MDS
+    mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+    mds_coords = mds.fit_transform(real_distance_matrix)
+
+    print(f"   MDS triangulation complete")
+
+    # CRITICAL STEP: Calibrate MDS coordinates to real distances
+    print(f"   🔧 Calibrating MDS coordinates to real kilometers...")
+    
+    # Calculate distances in MDS space
+    mds_distance_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                dx = mds_coords[i, 0] - mds_coords[j, 0]
+                dy = mds_coords[i, 1] - mds_coords[j, 1]
+                mds_distance_matrix[i, j] = np.sqrt(dx*dx + dy*dy)
+
+    # Find scaling factor by comparing MDS distances to real distances
+    valid_pairs = (mds_distance_matrix > 0) & (real_distance_matrix > 0)
+    mds_vals = mds_distance_matrix[valid_pairs]
+    real_vals = real_distance_matrix[valid_pairs]
+
+    scaling_factor = np.median(real_vals / mds_vals)
+    print(f"   Scaling factor: {scaling_factor:.4f} km per MDS unit")
+
+    # Scale coordinates to real kilometers
+    scaled_coords = mds_coords * scaling_factor
+
+    print(f"   Scaled coordinate ranges:")
+    print(f"   X: {scaled_coords[:, 0].min():.2f} to {scaled_coords[:, 0].max():.2f} km")
+    print(f"   Y: {scaled_coords[:, 1].min():.2f} to {scaled_coords[:, 1].max():.2f} km")
+
+    # Verification - check a few distances
+    print(f"   🔍 Verification (sample distances):")
+    verification_count = 0
+    total_error = 0
+    
+    for i in range(min(3, n)):
+        for j in range(i+1, min(i+3, n)):
+            if verification_count >= 5:  # Limit output
+                break
+                
+            # Real distance
+            real_dist = real_distance_matrix[i, j]
+            
+            # Calculated distance from scaled coordinates
+            dx = scaled_coords[i, 0] - scaled_coords[j, 0]
+            dy = scaled_coords[i, 1] - scaled_coords[j, 1]
+            calc_dist = np.sqrt(dx*dx + dy*dy)
+            
+            error = abs(real_dist - calc_dist)
+            error_pct = (error / real_dist * 100) if real_dist > 0 else 0
+            total_error += error_pct
+            verification_count += 1
+            
+            if verification_count <= 3:  # Show first 3
+                print(f"     {locations[i][:12]:12} -> {locations[j][:12]:12}: Real {real_dist:6.1f}km, Calc {calc_dist:6.1f}km, Err {error_pct:4.1f}%")
+        
+        if verification_count >= 5:
+            break
+
+    avg_error = total_error / verification_count if verification_count > 0 else 0
+    print(f"   Average error: {avg_error:.1f}%")
+
+    # Create DataFrame with properly scaled coordinates
+    df_coords = pd.DataFrame(scaled_coords, columns=["x", "y"])
     df_coords["center_id"] = locations
+
+    # Save coordinates
     coord_path.parent.mkdir(parents=True, exist_ok=True)
     df_coords.to_csv(coord_path, index=False)
+
+    print(f"   ✅ PROPERLY SCALED coordinates saved to {coord_path}")
+    print(f"   Ready for distance matrix generation!")
 
     return df_coords
