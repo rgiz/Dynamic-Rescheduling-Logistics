@@ -596,20 +596,34 @@ class CPSATOptimizer:
     High-level optimizer that combines candidate generation and CP-SAT solving.
     """
     
+class CPSATOptimizer:
+    """
+    High-level optimizer that combines candidate generation and CP-SAT solving.
+    """
+    
     def __init__(self,
                  driver_states: Dict[str, DriverState],
                  distance_matrix: Optional[np.ndarray] = None,
-                 location_to_index: Optional[Dict[str, int]] = None):
+                 location_to_index: Optional[Dict[str, int]] = None,
+                 cost_config: Optional[Dict[str, float]] = None):  # ✅ NEW PARAMETER
         """
         Initialize the optimizer.
+        
+        Args:
+            driver_states: Dictionary of driver_id -> DriverState objects
+            distance_matrix: Travel time matrix between locations
+            location_to_index: Mapping from location IDs to matrix indices
+            cost_config: Dictionary of cost constants for business rules  # ✅ NEW
         """
         self.driver_states = driver_states
+        self.cost_config = cost_config or {}  # ✅ Store config
         
-        # Initialize components
+        # Initialize components - PASS CONFIG TO CANDIDATE GENERATOR
         self.candidate_generator = CandidateGeneratorV2(
             driver_states=driver_states,
             distance_matrix=distance_matrix,
-            location_to_index=location_to_index
+            location_to_index=location_to_index,
+            cost_config=self.cost_config  # ✅ PASS CONFIG
         )
         
         self.metrics_calculator = MetricsCalculator()

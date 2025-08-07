@@ -56,31 +56,32 @@ class ReassignmentCandidate:
     
     # Cost (will be calculated)
     total_cost: float = 0.0
+    cost_config: Dict[str, float] = field(default_factory=dict)
     
     def calculate_total_cost(self) -> float:
         """
-        Calculate the total cost of this candidate assignment using embedded cost constants.
+        Calculate the total cost using provided cost configuration.
         """
-        # Embedded cost constants (should match your notebook constants)
-        DELAY_COST_PER_MINUTE = 1.0
-        DEADHEAD_COST_PER_MINUTE = 0.5
-        REASSIGNMENT_ADMIN_COST = 10.0
-        EMERGENCY_REST_PENALTY = 50.0
-        OUTSOURCING_BASE_COST = 200.0
+        # Use provided config with fallback defaults
+        delay_cost_per_min = self.cost_config.get('delay_cost_per_minute', 1.0)
+        deadhead_cost_per_min = self.cost_config.get('deadhead_cost_per_minute', 0.5)
+        admin_cost = self.cost_config.get('reassignment_admin_cost', 10.0)
+        emergency_penalty = self.cost_config.get('emergency_rest_penalty', 50.0)
+        outsourcing_base = self.cost_config.get('outsourcing_base_cost', 200.0)
         
         # Service quality costs
-        service_cost = self.delay_minutes * DELAY_COST_PER_MINUTE
+        service_cost = self.delay_minutes * delay_cost_per_min
         if self.emergency_rest_used:
-            service_cost += EMERGENCY_REST_PENALTY
+            service_cost += emergency_penalty
         
         # Operational costs
-        operational_cost = self.deadhead_minutes * DEADHEAD_COST_PER_MINUTE
+        operational_cost = self.deadhead_minutes * deadhead_cost_per_min
         if self.candidate_type in ['direct', 'cascade']:
-            operational_cost += REASSIGNMENT_ADMIN_COST
+            operational_cost += admin_cost
         
         # Outsourcing costs (if applicable)
         if self.candidate_type == 'outsource':
-            self.total_cost = OUTSOURCING_BASE_COST
+            self.total_cost = outsourcing_base
             return self.total_cost
         
         # Total cost for reassignment candidates
@@ -93,7 +94,6 @@ class CandidateGeneratorV2:
     """
     Generates feasible reassignment candidates for disrupted trips.
     """
-    
     def __init__(self,
                  driver_states: Dict[str, DriverState],
                  distance_matrix: Optional[np.ndarray] = None,
@@ -101,9 +101,7 @@ class CandidateGeneratorV2:
                  max_cascade_depth: int = 3,
                  max_deadhead_minutes: float = 120,
                  max_delay_minutes: float = 120,
-                 cost_per_minute_deadhead: float = 1.0,
-                 cost_per_minute_delay: float = 2.0,
-                 emergency_rest_penalty: float = 100.0):
+                 cost_config: Optional[Dict[str, float]] = None):  # ✅ NEW PARAMETER
         """
         Initialize candidate generator.
         """
@@ -114,10 +112,8 @@ class CandidateGeneratorV2:
         self.max_deadhead_minutes = max_deadhead_minutes
         self.max_delay_minutes = max_delay_minutes
         
-        # Cost parameters
-        self.cost_per_minute_deadhead = cost_per_minute_deadhead
-        self.cost_per_minute_delay = cost_per_minute_delay
-        self.emergency_rest_penalty = emergency_rest_penalty
+        # Store cost configuration
+        self.cost_config = cost_config or {}  # ✅ STORE CONFIG
         
         # Cache for performance
         self._driver_availability_cache = {}
@@ -203,7 +199,7 @@ class CandidateGeneratorV2:
                     candidates.append(candidate)
         
         return candidates
-    
+
     def _try_insert_at_position(self,
                             trip: Dict,
                             driver_id: str,
@@ -219,7 +215,8 @@ class CandidateGeneratorV2:
             candidate_type='direct',
             assigned_driver_id=driver_id,
             position_in_day=position,
-            cascade_depth=1
+            cascade_depth=1,
+            cost_config=self.cost_config  # ✅ PASS CONFIG TO CANDIDATE
         )
         
         # Calculate deadhead and delays
@@ -356,6 +353,8 @@ class CandidateGeneratorV2:
                 candidate.is_feasible = False
                 candidate.violations.append(f"Daily duty {total_day_minutes/60:.1f}h > 13h limit")
         
+        candidate.calculate_total_cost()
+
         return candidate
     
     def _generate_cascade_insertions(self,
@@ -537,17 +536,15 @@ class CandidateGeneratorV2:
         duration = getattr(assignment, 'duration_minutes', 0)
         return self._check_driver_capacity(driver_state, date_str, duration)
     
-    def _create_outsource_candidate(self,
-                                   disrupted_trip: Dict) -> ReassignmentCandidate:
-        """
-        Create an outsourcing candidate (fallback option).
-        """
+    def _create_outsource_candidate(self, disrupted_trip: Dict) -> ReassignmentCandidate:
+        """Create an outsourcing candidate (fallback option)."""
         candidate = ReassignmentCandidate(
             disrupted_trip_id=disrupted_trip['id'],
             candidate_type='outsource',
-            is_feasible=True
+            is_feasible=True,
+            cost_config=self.cost_config  # ✅ PASS CONFIG
         )
-        # Cost will be calculated by calculate_total_cost()
+        candidate.calculate_total_cost()  # ✅ Calculate with user config
         return candidate
     
     def get_candidate_summary(self,
