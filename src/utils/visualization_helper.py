@@ -57,26 +57,39 @@ class MetricsVisualizer:
                 
                 # Track delays for reassigned trips
                 delay = assignment.get('delay_minutes', 0)
-                delays.append(delay)
-                metrics['total_delay_minutes'] += delay
-                
-                if delay > 0:
-                    metrics['trips_with_delays'] += 1
-                    metrics['max_delay'] = max(metrics['max_delay'], delay)
-                else:
-                    metrics['trips_with_zero_delay'] += 1
+                # Only include finite delays
+                if delay != float('inf') and delay >= 0:
+                    delays.append(delay)
+                    metrics['total_delay_minutes'] += delay
+                    
+                    if delay > 0:
+                        metrics['trips_with_delays'] += 1
+                        metrics['max_delay'] = max(metrics['max_delay'], delay)
+                    else:
+                        metrics['trips_with_zero_delay'] += 1
                 
                 # Track deadhead miles for reassigned trips
-                deadhead_min = assignment.get('deadhead_minutes', 0)
-                # Convert minutes to miles (assuming 30 mph average speed)
-                deadhead_miles = (deadhead_min / 60) * 30
-                miles.append(deadhead_miles)
-                metrics['total_deadhead_miles'] += deadhead_miles
+                # Check if deadhead_miles is directly available first
+                if 'deadhead_miles' in assignment:
+                    deadhead_miles = assignment['deadhead_miles']
+                    if deadhead_miles != float('inf') and deadhead_miles >= 0:
+                        miles.append(deadhead_miles)
+                        metrics['total_deadhead_miles'] += deadhead_miles
+                else:
+                    # Fallback: calculate from deadhead_minutes
+                    deadhead_min = assignment.get('deadhead_minutes', 0)
+                    if deadhead_min != float('inf') and deadhead_min >= 0:
+                        # Convert minutes to miles (assuming 30 mph average speed)
+                        deadhead_miles = (deadhead_min / 60) * 30
+                        miles.append(deadhead_miles)
+                        metrics['total_deadhead_miles'] += deadhead_miles
         
         # Calculate averages for reassigned trips only
         if metrics['reassigned_count'] > 0:
-            metrics['avg_delay_per_reassigned'] = metrics['total_delay_minutes'] / metrics['reassigned_count']
-            metrics['avg_miles_per_reassigned'] = metrics['total_deadhead_miles'] / metrics['reassigned_count']
+            if delays:  # Only calculate if we have valid delay data
+                metrics['avg_delay_per_reassigned'] = sum(delays) / len(delays)
+            if miles:   # Only calculate if we have valid mileage data
+                metrics['avg_miles_per_reassigned'] = sum(miles) / len(miles)
         
         return metrics
     

@@ -205,12 +205,12 @@ class CandidateGeneratorV2:
         return candidates
     
     def _try_insert_at_position(self,
-                               trip: Dict,
-                               driver_id: str,
-                               driver_state: DriverState,
-                               date_str: str,
-                               position: int,
-                               existing_assignments: List[DailyAssignment]) -> Optional[ReassignmentCandidate]:
+                            trip: Dict,
+                            driver_id: str,
+                            driver_state: DriverState,
+                            date_str: str,
+                            position: int,
+                            existing_assignments: List[DailyAssignment]) -> Optional[ReassignmentCandidate]:
         """
         Try to insert a trip at a specific position in driver's day.
         """
@@ -225,6 +225,8 @@ class CandidateGeneratorV2:
         # Calculate deadhead and delays
         deadhead_before = 0
         deadhead_after = 0
+        deadhead_miles_before = 0
+        deadhead_miles_after = 0
         delay = 0
         
         # Check insertion feasibility and calculate metrics
@@ -237,6 +239,16 @@ class CandidateGeneratorV2:
                     trip['end_location'],
                     first_assignment.start_location
                 )
+                deadhead_miles_after = self._calculate_deadhead_miles(
+                    trip['end_location'],
+                    first_assignment.start_location
+                )
+                
+                # Check for invalid connections
+                if deadhead_after == float('inf') or deadhead_miles_after == float('inf'):
+                    candidate.is_feasible = False
+                    candidate.violations.append("No valid connection to next assignment")
+                    return candidate
                 
                 # Check if we'd delay the first assignment
                 trip_end_with_deadhead = trip['end_time'] + timedelta(minutes=deadhead_after)
@@ -252,6 +264,16 @@ class CandidateGeneratorV2:
                     last_assignment.end_location,
                     trip['start_location']
                 )
+                deadhead_miles_before = self._calculate_deadhead_miles(
+                    last_assignment.end_location,
+                    trip['start_location']
+                )
+                
+                # Check for invalid connections
+                if deadhead_before == float('inf') or deadhead_miles_before == float('inf'):
+                    candidate.is_feasible = False
+                    candidate.violations.append("No valid connection from previous assignment")
+                    return candidate
                 
                 # Check if we can reach the trip in time
                 earliest_arrival = last_assignment.end_time + timedelta(minutes=deadhead_before)
@@ -268,12 +290,27 @@ class CandidateGeneratorV2:
                 prev_assignment.end_location,
                 trip['start_location']
             )
+            deadhead_miles_before = self._calculate_deadhead_miles(
+                prev_assignment.end_location,
+                trip['start_location']
+            )
             
             # Calculate deadhead after
             deadhead_after = self._calculate_travel_time(
                 trip['end_location'],
                 next_assignment.start_location
             )
+            deadhead_miles_after = self._calculate_deadhead_miles(
+                trip['end_location'],
+                next_assignment.start_location
+            )
+            
+            # Check for invalid connections
+            if (deadhead_before == float('inf') or deadhead_miles_before == float('inf') or
+                deadhead_after == float('inf') or deadhead_miles_after == float('inf')):
+                candidate.is_feasible = False
+                candidate.violations.append("No valid connections for insertion")
+                return candidate
             
             # Check timing feasibility
             earliest_arrival = prev_assignment.end_time + timedelta(minutes=deadhead_before)
@@ -289,8 +326,9 @@ class CandidateGeneratorV2:
                 next_delay = (trip_end_with_deadhead - next_assignment.start_time).total_seconds() / 60
                 delay = max(delay, next_delay)
         
-        # Set candidate metrics
+        # Set candidate metrics (both time and distance)
         candidate.deadhead_minutes = deadhead_before + deadhead_after
+        candidate.deadhead_miles = deadhead_miles_before + deadhead_miles_after
         candidate.delay_minutes = delay
         
         # Check feasibility constraints
@@ -427,21 +465,51 @@ class CandidateGeneratorV2:
         # Check against 13-hour limit (with some buffer for deadhead)
         return total_with_new <= (13 * 60 - 30)  # 30 min buffer
     
+
     def _calculate_travel_time(self,
-                              from_location: str,
-                              to_location: str) -> float:
+                            from_location: str,
+                            to_location: str) -> float:
         """
         Calculate travel time between two locations.
+        
+        Returns:
+            float: Travel time in minutes, or float('inf') if no valid connection exists
         """
         if self.distance_matrix is None or self.location_to_index is None:
-            return 30.0  # Default 30 minutes
+            # No matrix available - cannot proceed
+            return float('inf')
         
         try:
             from_idx = self.location_to_index[from_location]
             to_idx = self.location_to_index[to_location]
-            return float(self.distance_matrix[from_idx, to_idx])
+            travel_time = float(self.distance_matrix[from_idx, to_idx])
+            
+            # Check for no-connection flag (-999) or any negative/invalid value
+            if travel_time == -999 or travel_time < 0:
+                return float('inf')  # Mark as non-viable connection
+                
+            return travel_time
+            
         except (KeyError, IndexError):
-            return 30.0  # Default if location not found
+            # Location not found in matrix
+            return float('inf')
+    def _calculate_deadhead_miles(self,
+                            from_location: str,
+                            to_location: str) -> float:
+        """
+        Calculate deadhead miles between two locations.
+        
+        Returns:
+            float: Distance in miles, or float('inf') if no valid connection exists
+        """
+        # Get travel time in minutes
+        travel_time = self._calculate_travel_time(from_location, to_location)
+        
+        if travel_time == float('inf'):
+            return float('inf')
+        
+        # Convert minutes to miles (assuming 30 mph average speed)
+        return (travel_time / 60) * 30
     
     def _get_moveable_assignments(self,
                                  driver_state: DriverState,
