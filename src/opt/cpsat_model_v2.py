@@ -23,11 +23,11 @@ from opt.candidate_gen_v2 import ReassignmentCandidate, CandidateGeneratorV2
 from evaluation_metrics import OptimizationMetrics, MetricsCalculator
 
 # Import regulatory constants
-DAILY_DUTY_LIMIT_MIN = 13 * 60      # 13 hours in minutes
-STANDARD_REST_MIN = 11 * 60         # 11 hours in minutes  
-EMERGENCY_REST_MIN = 9 * 60         # 9 hours in minutes
-WEEKEND_REST_MIN = 45 * 60          # 45 hours in minutes
-MAX_EMERGENCY_PER_WEEK = 2          # Maximum emergency rests per week
+# DAILY_DUTY_LIMIT_MIN = 13 * 60      # 13 hours in minutes
+# STANDARD_REST_MIN = 11 * 60         # 11 hours in minutes  
+# EMERGENCY_REST_MIN = 9 * 60         # 9 hours in minutes
+# WEEKEND_REST_MIN = 45 * 60          # 45 hours in minutes
+# MAX_EMERGENCY_PER_WEEK = 2          # Maximum emergency rests per week
 
 
 @dataclass
@@ -591,10 +591,10 @@ class MultiDriverCPSATModel:
         print(f"  • Weekend rest periods protected (≥45 hours)")
 
 
-class CPSATOptimizer:
-    """
-    High-level optimizer that combines candidate generation and CP-SAT solving.
-    """
+# class CPSATOptimizer:
+#     """
+#     High-level optimizer that combines candidate generation and CP-SAT solving.
+#     """
     
 class CPSATOptimizer:
     """
@@ -618,6 +618,20 @@ class CPSATOptimizer:
         self.driver_states = driver_states
         self.cost_config = cost_config or {}  # ✅ Store config
         
+        if not self.cost_config:
+            print("⚠️ WARNING: No cost_config provided - using emergency defaults")
+            self.cost_config = {
+                'deadhead_cost_per_km': 1.0,
+                'delay_cost_per_minute': 1.0,
+                'reassignment_admin_cost': 10.0,
+                'emergency_rest_penalty': 50.0,
+                'outsourcing_base_cost': 200.0
+            }
+        else:
+            print("✅ Using cost configuration from notebook:")
+            for key, value in self.cost_config.items():
+                print(f"   {key}: £{value}")
+        
         # Initialize components - PASS CONFIG TO CANDIDATE GENERATOR
         self.candidate_generator = CandidateGeneratorV2(
             driver_states=driver_states,
@@ -626,7 +640,13 @@ class CPSATOptimizer:
             cost_config=self.cost_config  # ✅ PASS CONFIG
         )
         
-        self.metrics_calculator = MetricsCalculator()
+        self.metrics_calculator = MetricsCalculator(
+            deadhead_cost_per_km=self.cost_config.get('deadhead_cost_per_km', 1.0),        # £ per km
+            cost_per_outsourced_trip=self.cost_config.get('outsourcing_base_cost', 200.0), # £ per trip
+            emergency_rest_penalty=self.cost_config.get('emergency_rest_penalty', 50.0),   # £ per use
+            reassignment_admin_cost=self.cost_config.get('reassignment_admin_cost', 10.0), # £ per reassignment
+            delay_cost_per_minute=self.cost_config.get('delay_cost_per_minute', 1.0)       # £ per minute
+        )
         
         self.cpsat_model = MultiDriverCPSATModel(
             driver_states=driver_states,
@@ -690,3 +710,37 @@ class CPSATOptimizer:
         self.cpsat_model._print_solution_summary(solution)
         
         return solution
+    
+    @classmethod
+    def from_matrices_file(cls,
+                          matrices_path: str,
+                          driver_states: Dict[str, DriverState],
+                          cost_config: Dict[str, float]) -> 'CPSATOptimizer':
+        """
+        CONVENIENCE METHOD: Create optimizer from matrix file with cost config.
+        
+        Args:
+            matrices_path: Path to dist_matrix.npz file
+            driver_states: Driver state dictionary
+            cost_config: Cost configuration from notebook (REQUIRED)
+        """
+        import numpy as np
+        
+        print(f"📂 Loading matrices from: {matrices_path}")
+        matrix_data = np.load(matrices_path)
+        
+        # Extract location mapping
+        location_to_index = {loc: i for i, loc in enumerate(matrix_data['ids'])}
+        
+        # Use the distance matrix (handles both old and new formats in candidate generator)
+        distance_matrix = matrix_data.get('dist', matrix_data.get('time_minutes', None))
+        
+        if distance_matrix is None:
+            raise ValueError("No valid matrix found in file")
+        
+        return cls(
+            driver_states=driver_states,
+            distance_matrix=distance_matrix,
+            location_to_index=location_to_index,
+            cost_config=cost_config  # ✅ PASS NOTEBOOK CONFIG
+        )

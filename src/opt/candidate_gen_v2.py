@@ -68,16 +68,25 @@ class ReassignmentCandidate:
         admin_cost = self.cost_config.get('reassignment_admin_cost', 10.0)
         emergency_penalty = self.cost_config.get('emergency_rest_penalty', 50.0)
         outsourcing_base = self.cost_config.get('outsourcing_base_cost', 200.0)
-        
+
         # Service quality costs
         service_cost = self.delay_minutes * delay_cost_per_min
         if self.emergency_rest_used:
             service_cost += emergency_penalty
         
         # Operational costs
-        operational_cost = self.deadhead_minutes * deadhead_cost_per_min
+        operational_cost = 0.0
         if self.candidate_type in ['direct', 'cascade']:
             operational_cost += admin_cost
+        
+        # Use distance-based cost if available, otherwise time-based
+        if hasattr(self, 'deadhead_miles') and self.deadhead_miles > 0:
+            # NEW: Use actual distance in km
+            deadhead_cost_per_km = self.cost_config.get('deadhead_cost_per_km', 1.0)
+            operational_cost += self.deadhead_miles * deadhead_cost_per_km
+        else:
+            # FALLBACK: Use time-based cost (legacy)
+            operational_cost += self.deadhead_minutes * deadhead_cost_per_min
         
         # Outsourcing costs (if applicable)
         if self.candidate_type == 'outsource':
@@ -97,6 +106,8 @@ class CandidateGeneratorV2:
     def __init__(self,
                  driver_states: Dict[str, DriverState],
                  distance_matrix: Optional[np.ndarray] = None,
+                 distance_km_matrix: Optional[np.ndarray] = None,    # NEW: Distance in km
+                 time_minutes_matrix: Optional[np.ndarray] = None,   # NEW: Time in minutes
                  location_to_index: Optional[Dict[str, int]] = None,
                  max_cascade_depth: int = 3,
                  max_deadhead_minutes: float = 120,
@@ -117,6 +128,21 @@ class CandidateGeneratorV2:
         
         # Cache for performance
         self._driver_availability_cache = {}
+
+        if distance_km_matrix is not None and time_minutes_matrix is not None:
+            # NEW FORMAT: Separate matrices for distance and time
+            self.distance_km_matrix = distance_km_matrix
+            self.time_minutes_matrix = time_minutes_matrix
+            self.distance_matrix = time_minutes_matrix  # Backward compatibility
+            print("✅ Using dual matrix format (distance_km + time_minutes)")
+        elif distance_matrix is not None:
+            # OLD FORMAT: Assume distance_matrix contains time in minutes
+            self.time_minutes_matrix = distance_matrix
+            self.distance_km_matrix = None  # Will estimate from time
+            print("⚠️ Using legacy matrix format - assuming time data")
+        else:
+            self.distance_km_matrix = None
+            self.time_minutes_matrix = None
     
     def generate_candidates(self, 
                           disrupted_trip: Dict,
@@ -324,8 +350,8 @@ class CandidateGeneratorV2:
                 delay = max(delay, next_delay)
         
         # Set candidate metrics (both time and distance)
-        candidate.deadhead_minutes = deadhead_before + deadhead_after
-        candidate.deadhead_miles = deadhead_miles_before + deadhead_miles_after
+        candidate.deadhead_minutes = deadhead_before + deadhead_after      # Time for constraints
+        candidate.deadhead_miles = deadhead_miles_before + deadhead_miles_after  # Distance for costs (in km now!)
         candidate.delay_minutes = delay
         
         # Check feasibility constraints
@@ -469,19 +495,21 @@ class CandidateGeneratorV2:
                             from_location: str,
                             to_location: str) -> float:
         """
-        Calculate travel time between two locations.
+        FIXED: Calculate travel TIME in minutes using time matrix.
         
         Returns:
             float: Travel time in minutes, or float('inf') if no valid connection exists
         """
-        if self.distance_matrix is None or self.location_to_index is None:
-            # No matrix available - cannot proceed
+        # Use time_minutes_matrix if available, otherwise fall back to distance_matrix
+        matrix_to_use = self.time_minutes_matrix if self.time_minutes_matrix is not None else self.distance_matrix
+        
+        if matrix_to_use is None or self.location_to_index is None:
             return float('inf')
         
         try:
             from_idx = self.location_to_index[from_location]
             to_idx = self.location_to_index[to_location]
-            travel_time = float(self.distance_matrix[from_idx, to_idx])
+            travel_time = float(matrix_to_use[from_idx, to_idx])
             
             # Check for no-connection flag (-999) or any negative/invalid value
             if travel_time == -999 or travel_time < 0:
@@ -492,23 +520,42 @@ class CandidateGeneratorV2:
         except (KeyError, IndexError):
             # Location not found in matrix
             return float('inf')
+        
     def _calculate_deadhead_miles(self,
                             from_location: str,
                             to_location: str) -> float:
         """
-        Calculate deadhead miles between two locations.
+        FIXED: Calculate deadhead DISTANCE in kilometers using distance matrix.
         
         Returns:
-            float: Distance in miles, or float('inf') if no valid connection exists
+            float: Distance in kilometers, or float('inf') if no valid connection exists
         """
-        # Get travel time in minutes
-        travel_time = self._calculate_travel_time(from_location, to_location)
+        if self.distance_km_matrix is not None and self.location_to_index is not None:
+            # NEW: Use dedicated distance matrix
+            if from_location == to_location:
+                return 0.0
+            
+            try:
+                from_idx = self.location_to_index[from_location]
+                to_idx = self.location_to_index[to_location]
+                distance_km = float(self.distance_km_matrix[from_idx, to_idx])
+                
+                # Check for no-connection flag (-999) or invalid values
+                if distance_km == -999 or distance_km < 0:
+                    return float('inf')  # Hub-spoke blocking
+                    
+                return distance_km
+                
+            except (KeyError, IndexError):
+                return float('inf')
         
-        if travel_time == float('inf'):
-            return float('inf')
-        
-        # Convert minutes to miles (assuming 30 mph average speed)
-        return (travel_time / 60) * 30
+        else:
+            # FALLBACK: Estimate from travel time if distance matrix not available
+            travel_time = self._calculate_travel_time(from_location, to_location)
+            if travel_time == float('inf'):
+                return float('inf')
+            # Rough estimate: 60 km/h average speed
+            return (travel_time / 60) * 60  # minutes / (min/h) * (km/h) = km
     
     def _get_moveable_assignments(self,
                                  driver_state: DriverState,
@@ -568,3 +615,42 @@ class CandidateGeneratorV2:
             })
         
         return pd.DataFrame(data)
+    
+    @classmethod
+    def load_from_matrices_file(cls, 
+                               matrices_path: str,
+                               driver_states: Dict[str, DriverState],
+                               cost_config: Optional[Dict[str, float]] = None) -> 'CandidateGeneratorV2':
+        """
+        CONVENIENCE METHOD: Load matrices from file and create generator.
+        Handles both old and new matrix formats.
+        """
+        import numpy as np
+        
+        matrix_data = np.load(matrices_path)
+        location_to_index = {loc: i for i, loc in enumerate(matrix_data['ids'])}
+        
+        # Load matrices - prefer new format, fallback to old
+        distance_km_matrix = None
+        time_minutes_matrix = None
+        
+        if 'distance_km' in matrix_data and 'time_minutes' in matrix_data:
+            # NEW FORMAT
+            distance_km_matrix = matrix_data['distance_km']
+            time_minutes_matrix = matrix_data['time_minutes']
+            print("✅ Loaded new dual matrix format")
+        elif 'dist' in matrix_data:
+            # OLD FORMAT - assume 'dist' contains time in minutes
+            time_minutes_matrix = matrix_data['dist']
+            print("⚠️ Loaded legacy matrix format - assuming time data")
+        else:
+            raise ValueError("No valid matrices found in file")
+        
+        return cls(
+            driver_states=driver_states,
+            distance_matrix=time_minutes_matrix,  # Backward compatibility
+            distance_km_matrix=distance_km_matrix,
+            time_minutes_matrix=time_minutes_matrix,
+            location_to_index=location_to_index,
+            cost_config=cost_config
+        )

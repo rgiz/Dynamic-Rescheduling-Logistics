@@ -36,6 +36,7 @@ class CostMetrics:
     """
     deadhead_minutes: float = 0.0  # Total deadhead/empty travel time
     deadhead_cost: float = 0.0  # Cost of deadhead travel
+    delay_cost: float = 0.0
     
     outsourcing_count: int = 0  # Number of trips outsourced
     outsourcing_cost: float = 0.0  # Total outsourcing cost
@@ -66,6 +67,7 @@ class CostMetrics:
         
         self.total_cost = (
             self.deadhead_cost * weights.get('deadhead_weight', 1.0) +
+            self.delay_cost * weights.get('delay_weight', 1.0) +        # NEW LINE
             self.outsourcing_cost * weights.get('outsourcing_weight', 1.0) +
             self.emergency_rest_penalty * weights.get('emergency_weight', 1.0) +
             self.reassignment_cost * weights.get('reassignment_weight', 1.0)
@@ -333,6 +335,8 @@ class OptimizationMetrics:
         print(f"  • Total Cost: ${self.cost.total_cost:,.2f}")
         print(f"  • Deadhead Cost: ${self.cost.deadhead_cost:,.2f}")
         print(f"  • Outsourcing Cost: ${self.cost.outsourcing_cost:,.2f}")
+        print(f"  • Delay Cost: ${self.cost.delay_cost:,.2f}")
+        print(f"  • SLA Breaches: {getattr(self.operational, 'sla_breaches', 0)}")
         
         print("\n📋 SLA COMPLIANCE")
         print(f"  • On-Time Rate: {self.sla.on_time_rate:.1%}")
@@ -357,25 +361,27 @@ class MetricsCalculator:
     Utility class to calculate metrics from optimization results.
     This bridges the gap between raw optimization output and metrics.
     """
-    
     def __init__(self, 
-                 cost_per_minute_deadhead: float = 1.0,
-                 cost_per_outsourced_trip: float = 500.0,
-                 emergency_rest_penalty: float = 100.0,
-                 reassignment_admin_cost: float = 20.0):
+                 deadhead_cost_per_km: float = 1.0,           # CHANGED: Now per km, not per minute
+                 cost_per_outsourced_trip: float = 200.0,     # CHANGED: Default matches notebook
+                 emergency_rest_penalty: float = 50.0,       # CHANGED: Default matches notebook
+                 reassignment_admin_cost: float = 10.0,      # CHANGED: Default matches notebook
+                 delay_cost_per_minute: float = 1.0):        # NEW: Separate delay cost
         """
         Initialize calculator with cost parameters.
         
         Args:
-            cost_per_minute_deadhead: Cost per minute of deadhead travel
-            cost_per_outsourced_trip: Fixed cost per outsourced trip
+            deadhead_cost_per_km: FIXED - Cost per kilometer of deadhead travel
+            cost_per_outsourced_trip: Fixed cost per outsourced trip  
             emergency_rest_penalty: Penalty for using emergency rest
             reassignment_admin_cost: Administrative cost per reassignment
+            delay_cost_per_minute: Cost per minute of service delay
         """
-        self.cost_per_minute_deadhead = cost_per_minute_deadhead
+        self.deadhead_cost_per_km = deadhead_cost_per_km           # CHANGED
         self.cost_per_outsourced_trip = cost_per_outsourced_trip
         self.emergency_rest_penalty = emergency_rest_penalty
         self.reassignment_admin_cost = reassignment_admin_cost
+        self.delay_cost_per_minute = delay_cost_per_minute  
 
     def _validate_driver_compliance(self, driver_state, metrics):
         """Check driver state for compliance violations."""
@@ -484,9 +490,28 @@ class MetricsCalculator:
                 metrics.operational.cancelled += 1
         
         # Calculate costs
-        metrics.cost.deadhead_cost = (
-            metrics.cost.deadhead_minutes * self.cost_per_minute_deadhead
-        )
+        # Deadhead cost: Use kilometers if available, otherwise estimate from minutes
+        total_deadhead_km = 0.0
+        total_delay_minutes = 0.0
+        
+        for assignment in reassignments:
+            if assignment['type'] == 'reassigned':
+                # FIXED: Use actual deadhead distance in kilometers
+                if 'deadhead_km' in assignment:
+                    total_deadhead_km += assignment['deadhead_km']
+                elif 'deadhead_miles' in assignment:
+                    # Convert miles to km if needed (1 mile = 1.60934 km)
+                    total_deadhead_km += assignment['deadhead_miles'] * 1.60934
+                elif 'deadhead_minutes' in assignment:
+                    # Fallback: estimate km from minutes (60 km/h average)
+                    total_deadhead_km += (assignment['deadhead_minutes'] / 60) * 60
+                
+                # Track service delays separately
+                if 'delay_minutes' in assignment:
+                    total_delay_minutes += assignment['delay_minutes']
+        
+        metrics.cost.deadhead_cost = total_deadhead_km * self.deadhead_cost_per_km
+        metrics.cost.delay_cost = total_delay_minutes * self.delay_cost_per_minute  # NEW
         metrics.cost.outsourcing_cost = (
             metrics.cost.outsourcing_count * self.cost_per_outsourced_trip
         )
@@ -549,3 +574,22 @@ def create_bo_objective(metrics_calculator: MetricsCalculator):
         pass
     
     return objective
+
+def count_sla_breaches(self, reassignments: List[Dict], breach_threshold_minutes: float = 30) -> int:
+    """
+    Count number of SLA breaches (delays exceeding threshold).
+    
+    Args:
+        reassignments: List of assignment decisions
+        breach_threshold_minutes: Delay threshold for SLA breach (default: 30 minutes)
+        
+    Returns:
+        Number of trips with delays exceeding the threshold
+    """
+    breaches = 0
+    for assignment in reassignments:
+        if assignment.get('type') == 'reassigned':
+            delay = assignment.get('delay_minutes', 0)
+            if delay > breach_threshold_minutes:
+                breaches += 1
+    return breaches

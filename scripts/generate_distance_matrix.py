@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Segment-Based Distance Matrix Generation
-=======================================
+Segment-Based Distance Matrix Generation - FIXED VERSION
+=======================================================
 
-Replaces the existing generate_distance_matrix.py to use segment-level data
-from cleaned.csv instead of trip-level aggregation.
-
-Key features:
-- Uses actual segment connections from delivery data
-- Flags missing connections with sentinel value for candidate generation
-- Adds connectivity metadata for smart routing decisions
-- Maintains compatibility with existing workflow
+MAJOR CHANGES:
+- Now generates TWO separate matrices: distance_km and time_minutes
+- Saves both matrices in dist_matrix.npz
+- Maintains hub-spoke logic with -999 no-connection flags
+- Properly handles units: kilometers for cost calculations, minutes for delays
 
 Usage (from repo root):
     python3 scripts/generate_distance_matrix.py
@@ -24,7 +21,7 @@ from collections import defaultdict
 import argparse
 
 class SegmentBasedMatrixGenerator:
-    """Generates distance matrix from segment-level delivery data."""
+    """Generates DUAL distance/time matrices from segment-level delivery data."""
     
     def __init__(self, no_connection_flag=-999):
         """
@@ -39,6 +36,8 @@ class SegmentBasedMatrixGenerator:
         self.all_locations = None
         self.location_to_index = None
         self.location_connectivity = None
+        self.distance_matrix_km = None  # NEW: Distance in kilometers
+        self.time_matrix_min = None     # NEW: Time in minutes
         
     def load_segment_data(self, project_root: Path):
         """Load segment-level data from cleaned.csv."""
@@ -63,9 +62,9 @@ class SegmentBasedMatrixGenerator:
         segment_cols = ['source_center', 'destination_center', 'segment_osrm_distance']
         if 'segment_osrm_time' in df_cleaned.columns:
             segment_cols.append('segment_osrm_time')
-            print("✅ Found segment_osrm_time column")
+            print("✅ Found segment_osrm_time column - will use real time data")
         else:
-            print("⚠️ No segment_osrm_time - will calculate from distance")
+            print("⚠️ No segment_osrm_time - will estimate from distance at 60 km/h")
         
         # Filter to valid segments
         self.segments_df = df_cleaned[segment_cols].copy()
@@ -144,18 +143,20 @@ class SegmentBasedMatrixGenerator:
         else:
             return 'hub'
     
-    def build_distance_matrix(self):
-        """Build distance matrix from segment data."""
-        print(f"\n🏗️ BUILDING DISTANCE MATRIX")
+    def build_dual_matrices(self):
+        """Build SEPARATE distance and time matrices from segment data."""
+        print(f"\n🏗️ BUILDING DUAL DISTANCE/TIME MATRICES")
         print("=" * 30)
         
         n = len(self.all_locations)
-        distance_matrix = np.full((n, n), self.no_connection_flag, dtype=np.float32)
-        time_matrix = np.full((n, n), self.no_connection_flag, dtype=np.float32)
         
-        # Fill diagonal (same location = 0)
-        np.fill_diagonal(distance_matrix, 0)
-        np.fill_diagonal(time_matrix, 0)
+        # Initialize both matrices with no-connection flags
+        self.distance_matrix_km = np.full((n, n), self.no_connection_flag, dtype=np.float32)
+        self.time_matrix_min = np.full((n, n), self.no_connection_flag, dtype=np.float32)
+        
+        # Fill diagonals (same location = 0)
+        np.fill_diagonal(self.distance_matrix_km, 0)
+        np.fill_diagonal(self.time_matrix_min, 0)
         
         # Aggregate segment data (median for multiple segments between same locations)
         print("   Aggregating segment pairs...")
@@ -167,36 +168,36 @@ class SegmentBasedMatrixGenerator:
         
         print(f"   Aggregated to {len(segment_pairs):,} unique location pairs")
         
-        # Fill matrix with direct connections
+        # Fill matrices with direct connections
         connections_added = 0
         for _, row in segment_pairs.iterrows():
             src, dst = row['source_center'], row['destination_center']
-            distance = row['segment_osrm_distance']
+            distance_km = row['segment_osrm_distance']  # KILOMETERS
             
             if src in self.location_to_index and dst in self.location_to_index:
                 i, j = self.location_to_index[src], self.location_to_index[dst]
                 
-                # Set distance (make symmetric)
-                distance_matrix[i, j] = distance
-                distance_matrix[j, i] = distance
+                # DISTANCE MATRIX: Store kilometers (for cost calculations)
+                self.distance_matrix_km[i, j] = distance_km
+                self.distance_matrix_km[j, i] = distance_km  # Make symmetric
                 
-                # Set time
+                # TIME MATRIX: Store minutes (for delay calculations)
                 if 'segment_osrm_time' in row.index and pd.notna(row['segment_osrm_time']):
-                    time_val = row['segment_osrm_time']
+                    time_min = row['segment_osrm_time']  # Real time data in minutes
                 else:
-                    # Calculate time from distance at 60 km/h
-                    time_val = distance / 60 * 60  # km / (km/h) * (min/h) = minutes
+                    # Estimate time from distance at 60 km/h
+                    time_min = (distance_km / 60) * 60  # km / (km/h) * (min/h) = minutes
                 
-                time_matrix[i, j] = time_val
-                time_matrix[j, i] = time_val
+                self.time_matrix_min[i, j] = time_min
+                self.time_matrix_min[j, i] = time_min  # Make symmetric
                 
                 connections_added += 1
         
-        print(f"✅ Added {connections_added:,} direct connections")
+        print(f"✅ Added {connections_added:,} direct connections to both matrices")
         
         # Calculate coverage statistics
         total_pairs = n * (n - 1)  # Exclude diagonal
-        real_connections = (distance_matrix != self.no_connection_flag).sum() - n  # Exclude diagonal
+        real_connections = (self.distance_matrix_km != self.no_connection_flag).sum() - n  # Exclude diagonal
         coverage_percent = real_connections / total_pairs * 100
         
         print(f"📊 Matrix Statistics:")
@@ -204,35 +205,43 @@ class SegmentBasedMatrixGenerator:
         print(f"   Real connections: {real_connections:,} ({coverage_percent:.1f}%)")
         print(f"   Missing connections: {total_pairs - real_connections:,} (flagged as {self.no_connection_flag})")
         
-        # Show distance statistics for real connections only
-        real_distances = distance_matrix[(distance_matrix != self.no_connection_flag) & (distance_matrix > 0)]
+        # Show statistics for real connections only
+        real_distances = self.distance_matrix_km[(self.distance_matrix_km != self.no_connection_flag) & (self.distance_matrix_km > 0)]
+        real_times = self.time_matrix_min[(self.time_matrix_min != self.no_connection_flag) & (self.time_matrix_min > 0)]
+        
         if len(real_distances) > 0:
             print(f"   Distance range: {real_distances.min():.1f} - {real_distances.max():.1f} km")
             print(f"   Mean distance: {real_distances.mean():.1f} km")
         
-        self.distance_matrix = distance_matrix
-        self.time_matrix = time_matrix
+        if len(real_times) > 0:
+            print(f"   Time range: {real_times.min():.1f} - {real_times.max():.1f} minutes")
+            print(f"   Mean time: {real_times.mean():.1f} minutes")
         
-        return distance_matrix, time_matrix
+        return self.distance_matrix_km, self.time_matrix_min
     
-    def save_matrix_and_metadata(self, project_root: Path):
-        """Save distance matrix and connectivity metadata."""
-        print(f"\n💾 SAVING MATRIX AND METADATA")
+    def save_dual_matrices_and_metadata(self, project_root: Path):
+        """Save BOTH distance and time matrices plus connectivity metadata."""
+        print(f"\n💾 SAVING DUAL MATRICES AND METADATA")
         print("=" * 30)
         
-        # Save main distance matrix
+        # Save dual matrices in single file
         dist_path = project_root / "data" / "dist_matrix.npz"
         dist_path.parent.mkdir(parents=True, exist_ok=True)
         
         np.savez_compressed(
             dist_path,
             ids=np.array(self.all_locations),
-            dist=self.distance_matrix,
-            time=self.time_matrix,
-            no_connection_flag=self.no_connection_flag
+            distance_km=self.distance_matrix_km,    # NEW: Distance in kilometers
+            time_minutes=self.time_matrix_min,      # NEW: Time in minutes
+            no_connection_flag=self.no_connection_flag,
+            # DEPRECATED: Remove these old fields after migration
+            dist=self.distance_matrix_km,  # Backward compatibility (temporary)
+            time=self.time_matrix_min      # Backward compatibility (temporary)
         )
         
-        print(f"✅ Distance matrix saved: {dist_path}")
+        print(f"✅ Dual matrices saved: {dist_path}")
+        print(f"   - distance_km: Cost calculations (£ per km)")
+        print(f"   - time_minutes: Delay calculations (service impact)")
         
         # Save connectivity metadata
         connectivity_data = []
@@ -262,12 +271,12 @@ class SegmentBasedMatrixGenerator:
         return dist_path, connectivity_path
     
     def create_analysis_report(self, project_root: Path):
-        """Create analysis report for the generated matrix."""
+        """Create analysis report for the generated dual matrices."""
         
         # Calculate summary statistics
         total_locations = len(self.all_locations)
         total_segments = len(self.segments_df)
-        real_connections = (self.distance_matrix != self.no_connection_flag).sum() - total_locations
+        real_connections = (self.distance_matrix_km != self.no_connection_flag).sum() - total_locations
         total_pairs = total_locations * (total_locations - 1)
         coverage = real_connections / total_pairs * 100
         
@@ -275,10 +284,16 @@ class SegmentBasedMatrixGenerator:
         conn_counts = [stats['connection_count'] for stats in self.location_connectivity.values()]
         tier_counts = pd.Series([stats['connectivity_tier'] for stats in self.location_connectivity.values()]).value_counts()
         
-        # Real distance stats
-        real_distances = self.distance_matrix[(self.distance_matrix != self.no_connection_flag) & (self.distance_matrix > 0)]
+        # Real distance and time stats
+        real_distances = self.distance_matrix_km[(self.distance_matrix_km != self.no_connection_flag) & (self.distance_matrix_km > 0)]
+        real_times = self.time_matrix_min[(self.time_matrix_min != self.no_connection_flag) & (self.time_matrix_min > 0)]
         
-        report = f"""# Segment-Based Distance Matrix Analysis
+        report = f"""# Dual Distance/Time Matrix Analysis
+
+## MAJOR UPDATE: DUAL MATRIX STRUCTURE
+This version generates TWO separate matrices:
+- **distance_km**: For cost calculations (£ per kilometer of deadhead)
+- **time_minutes**: For service impact calculations (minutes of delay)
 
 ## Matrix Statistics
 
@@ -291,13 +306,21 @@ class SegmentBasedMatrixGenerator:
 | Missing Connections | {total_pairs - real_connections:,} |
 | No-Connection Flag | {self.no_connection_flag} |
 
-## Distance Analysis (Real Connections Only)
+## Distance Analysis (Cost Basis)
 
 | Metric | Value |
 |--------|--------|
 | Distance Range | {real_distances.min():.1f} - {real_distances.max():.1f} km |
 | Mean Distance | {real_distances.mean():.1f} km |
 | Median Distance | {np.median(real_distances):.1f} km |
+
+## Time Analysis (Service Impact)
+
+| Metric | Value |
+|--------|--------|
+| Time Range | {real_times.min():.1f} - {real_times.max():.1f} minutes |
+| Mean Time | {real_times.mean():.1f} minutes |
+| Median Time | {np.median(real_times):.1f} minutes |
 
 ## Location Connectivity
 
@@ -328,27 +351,41 @@ class SegmentBasedMatrixGenerator:
         
         report += f"""
 
-## Implementation Notes
+## Implementation Notes for Code Updates
+
+### CRITICAL: Update Matrix Loading Code
+```python
+# OLD (broken):
+matrix_data = np.load('dist_matrix.npz')
+distance_matrix = matrix_data['dist']  # This was confusing time/distance
+
+# NEW (fixed):
+matrix_data = np.load('dist_matrix.npz')
+distance_km_matrix = matrix_data['distance_km']    # For cost calculations
+time_minutes_matrix = matrix_data['time_minutes']  # For delay calculations
+```
 
 ### For Candidate Generation:
-1. **Check for no-connection flag**: `if travel_time == {self.no_connection_flag}: skip_candidate()`
-2. **Prefer well-connected locations**: Use `location_connectivity.csv` to prioritize
-3. **Implement distance limits**: Reject candidates with excessive travel times
-4. **Hub-based routing**: Route through 'hub' and 'high' tier locations
+1. **Cost calculations**: Use `distance_km_matrix` × £ per km
+2. **Delay calculations**: Use `time_minutes_matrix` (minutes)
+3. **No-connection handling**: Both matrices use {self.no_connection_flag} flag
+4. **Hub-spoke logic**: Preserved in both matrices
 
-### Matrix Usage:
-- **Real connections**: Use directly for routing
-- **Missing connections ({self.no_connection_flag})**: Implement fallback strategy
-- **Connectivity tiers**: Guide assignment preferences
+### Next Phase Requirements:
+1. Update `CandidateGeneratorV2` to load both matrices
+2. Fix `_calculate_travel_time()` to use time matrix
+3. Add `_calculate_travel_distance()` to use distance matrix
+4. Update all cost calculations to use kilometers, not estimated miles
 
 ### Quality Metrics:
-- **{coverage:.1f}% coverage** from segment data - much better than trip-level aggregation
-- **{sum(1 for c in conn_counts if c == 0)} isolated locations** - handle separately
+- **{coverage:.1f}% coverage** from segment data
+- **{sum(1 for c in conn_counts if c == 0)} isolated locations** - handle with outsourcing
 - **{sum(1 for c in conn_counts if c > 10)} well-connected locations** - prioritize for assignments
+- **Dual matrix structure** enables proper cost vs service optimization
 """
         
         # Save report
-        report_path = project_root / "segment_matrix_analysis.md"
+        report_path = project_root / "dual_matrix_analysis.md"
         with open(report_path, 'w') as f:
             f.write(report)
         
@@ -356,9 +393,9 @@ class SegmentBasedMatrixGenerator:
         return report_path
 
 def main():
-    """Generate segment-based distance matrix."""
+    """Generate segment-based dual distance/time matrices."""
     
-    parser = argparse.ArgumentParser(description='Generate distance matrix from segment data')
+    parser = argparse.ArgumentParser(description='Generate dual distance/time matrices from segment data')
     parser.add_argument('--no-connection-flag', type=float, default=-999,
                        help='Flag value for missing connections (default: -999)')
     parser.add_argument('--project-root', type=Path, default=None,
@@ -366,8 +403,9 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚛 SEGMENT-BASED DISTANCE MATRIX GENERATION")
+    print("🚛 DUAL DISTANCE/TIME MATRIX GENERATION")
     print("=" * 60)
+    print("MAJOR UPDATE: Generates separate distance_km and time_minutes matrices")
     print("Strategy: Use actual delivery segments from cleaned.csv")
     print(f"No-connection flag: {args.no_connection_flag}")
     print("=" * 60)
@@ -385,23 +423,25 @@ def main():
         # Run generation pipeline
         generator.load_segment_data(project_root)
         generator.calculate_location_connectivity()
-        generator.build_distance_matrix()
-        dist_path, conn_path = generator.save_matrix_and_metadata(project_root)
+        generator.build_dual_matrices()  # NEW: Build both matrices
+        dist_path, conn_path = generator.save_dual_matrices_and_metadata(project_root)  # NEW: Save both
         report_path = generator.create_analysis_report(project_root)
         
         print(f"\n" + "=" * 60)
-        print("✅ SEGMENT-BASED MATRIX GENERATION COMPLETE!")
+        print("✅ DUAL MATRIX GENERATION COMPLETE!")
         print("=" * 60)
         
         print(f"\nFiles generated:")
-        print(f"- {dist_path} (distance matrix)")
+        print(f"- {dist_path} (dual matrices: distance_km + time_minutes)")
         print(f"- {conn_path} (connectivity metadata)")
         print(f"- {report_path} (analysis report)")
         
-        print(f"\nNext steps:")
-        print(f"1. Update candidate generation to handle no-connection flag ({args.no_connection_flag})")
-        print(f"2. Use connectivity metadata for smart routing decisions")
-        print(f"3. Test with: python3 val.py")
+        print(f"\n🚨 NEXT STEPS - PHASE 2:")
+        print(f"1. Update CandidateGeneratorV2 to load both matrices")
+        print(f"2. Fix _calculate_travel_time() to use time_minutes matrix")
+        print(f"3. Add _calculate_travel_distance() to use distance_km matrix")
+        print(f"4. Update cost calculations to use km not estimated miles")
+        print(f"5. Test with: python3 val.py")
         
         return 0
         
