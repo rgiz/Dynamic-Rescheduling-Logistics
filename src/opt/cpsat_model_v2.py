@@ -19,6 +19,7 @@ import numpy as np
 import time
 
 from models.driver_state import DriverState, DailyAssignment
+from models.driver_state import DAILY_DUTY_LIMIT_MIN, EMERGENCY_REST_MIN, MAX_EMERGENCY_PER_WEEK, STANDARD_REST_MIN, WEEKEND_REST_MIN, MAX_DELAY_TOLERANCE_MIN, MAX_EMERGENCY_PER_WEEK
 from opt.candidate_gen_v2 import ReassignmentCandidate, CandidateGeneratorV2
 from evaluation_metrics import OptimizationMetrics, MetricsCalculator
 
@@ -60,29 +61,65 @@ class MultiDriverCPSATModel:
     """
     
     def __init__(self,
-                 driver_states: Dict[str, DriverState],
-                 metrics_calculator: MetricsCalculator,
-                 max_solve_time_seconds: float = 30.0,
-                 num_workers: int = 4):
+                driver_states: Dict[str, DriverState],
+                metrics_calculator: MetricsCalculator,
+                cost_config: Dict[str, float],  # ← ADD THIS PARAMETER
+                max_solve_time_seconds: float = 30.0,
+                num_workers: int = 4):
         """
         Initialize the CP-SAT model.
         
         Args:
             driver_states: Dictionary of driver_id -> DriverState objects
-            metrics_calculator: Calculator for evaluation metrics
-            max_solve_time_seconds: Maximum time for solver
-            num_workers: Number of parallel workers for solver
+            metrics_calculator: For calculating solution metrics
+            cost_config: Dictionary of cost constants  # ← ADD THIS
+            max_solve_time_seconds: Maximum time to spend solving
+            num_workers: Number of parallel workers for solving
         """
         self.driver_states = driver_states
         self.metrics_calculator = metrics_calculator
+        self.cost_config = cost_config  # ← STORE THE CONFIG
         self.max_solve_time_seconds = max_solve_time_seconds
         self.num_workers = num_workers
         
-        # Model components
-        self.model = None
-        self.solver = None
+        # Initialize CP-SAT model components - NEW
+        self.model = cp_model.CpModel()
         self.decision_vars = {}
-        self.helper_vars = {}
+
+
+    def _safe_get_variable_value(self, solver, variable):
+        """Safely get variable value, handling solver state issues."""
+        try:
+            return solver.Value(variable)
+        except RuntimeError as e:
+            if "solve() has not been called" in str(e):
+                return 0  # Default to unselected when solver fails
+            else:
+                raise e
+    
+    def _safe_get_objective_value(self, solver, status):
+        """Safely extract objective value, handling solver state issues."""
+        try:
+            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                return solver.ObjectiveValue()
+            else:
+                return float('inf')
+        except RuntimeError as e:
+            if "solve() has not been called" in str(e):
+                print(f"⚠️ Solver state error: {e}")
+                return float('inf')
+            else:
+                raise e
+    
+    def _safe_get_solver_stat(self, solver, stat_method):
+        """Safely extract solver statistics, handling solver state issues."""
+        try:
+            return getattr(solver, stat_method)()
+        except RuntimeError as e:
+            if "solve() has not been called" in str(e):
+                return 0  # Default value when solver hasn't been called
+            else:
+                raise e
         
     def solve(self,
               disrupted_trips: List[Dict],
@@ -105,6 +142,8 @@ class MultiDriverCPSATModel:
         
         # Initialize model
         self.model = cp_model.CpModel()
+        self.decision_vars = {}
+        self.objective_terms = []
         
         # Debug model setup
         self._debug_model_setup(disrupted_trips, candidates_per_trip)
@@ -139,6 +178,7 @@ class MultiDriverCPSATModel:
         self._add_emergency_rest_quota_constraints(candidates_per_trip)
         self._add_weekend_rest_constraints(disrupted_trips, candidates_per_trip)
         self._add_cascade_constraints(candidates_per_trip)
+        self._add_driver_exclusivity_constraints(candidates_per_trip)
         
         # 3. Create objective function (cost vs service ONLY)
         self._create_objective_function(candidates_per_trip, normalized_weights)
@@ -156,6 +196,39 @@ class MultiDriverCPSATModel:
         )
         
         return solution
+    
+    def _add_driver_exclusivity_constraints(self, candidates_per_trip: Dict[str, List[ReassignmentCandidate]]):
+        """
+        Ensure each driver is assigned to at most one disrupted trip.
+        Prevents the same driver being selected for multiple disruptions.
+        """
+        driver_assignment_vars = {}
+        
+        # Collect all decision variables by driver
+        for trip_id, candidates in candidates_per_trip.items():
+            for i, candidate in enumerate(candidates):
+                # Skip outsourcing candidates (no driver involved)
+                if getattr(candidate, 'candidate_type', '') == 'outsource':
+                    continue
+                    
+                driver_id = getattr(candidate, 'assigned_driver_id', None)
+                if driver_id:
+                    if driver_id not in driver_assignment_vars:
+                        driver_assignment_vars[driver_id] = []
+                    
+                    # Add this candidate's decision variable
+                    if (trip_id, i) in self.decision_vars:
+                        driver_assignment_vars[driver_id].append(self.decision_vars[(trip_id, i)])
+        
+        # Add constraints: each driver can be assigned to at most one trip
+        drivers_with_constraints = 0
+        for driver_id, vars_list in driver_assignment_vars.items():
+            if len(vars_list) > 1:
+                # This driver appears in multiple candidates - add exclusivity constraint
+                self.model.Add(sum(vars_list) <= 1)
+                drivers_with_constraints += 1
+        
+        print(f"  Driver exclusivity constraints: {drivers_with_constraints} drivers with multiple candidate options")
     
     def _debug_model_setup(self, disrupted_trips, candidates_per_trip):
         """Add debug output to identify setup issues."""
@@ -411,7 +484,7 @@ class MultiDriverCPSATModel:
                 service_penalty = 0
                 delay_minutes = getattr(candidate, 'delay_minutes', 0) or 0
                 if delay_minutes > 0:
-                    service_penalty = delay_minutes * 2  # $2 per minute delay
+                    service_penalty = delay_minutes * self.cost_config.get('delay_cost_per_minute', 1.0)
                 
                 # Combine cost and service objectives
                 weighted_objective = (
@@ -426,7 +499,7 @@ class MultiDriverCPSATModel:
                 
                 # Ensure we have a valid objective value
                 if weighted_objective > 0:
-                    objective_terms.append(var * int(weighted_objective * cost_scale))
+                    objective_terms.append(var * int(weighted_objective))
         
         # Handle case where no objective terms exist
         if objective_terms:
@@ -483,10 +556,10 @@ class MultiDriverCPSATModel:
         
         solution = CPSATSolution(
             status=status_map.get(status, 'UNKNOWN'),
-            objective_value=solver.ObjectiveValue() if status in [cp_model.OPTIMAL, cp_model.FEASIBLE] else float('inf'),
+            objective_value=self._safe_get_objective_value(solver, status),
             solve_time_seconds=solve_time,
-            num_branches=solver.NumBranches(),
-            num_conflicts=solver.NumConflicts()
+            num_branches=self._safe_get_solver_stat(solver, 'NumBranches'),
+            num_conflicts=self._safe_get_solver_stat(solver, 'NumConflicts')
         )
         
         # Extract selected assignments if feasible
@@ -498,7 +571,7 @@ class MultiDriverCPSATModel:
                 
                 for i, candidate in enumerate(candidates_per_trip[trip_id]):
                     if (trip_id, i) in self.decision_vars:
-                        if solver.Value(self.decision_vars[(trip_id, i)]) == 1:
+                        if self._safe_get_variable_value(solver, self.decision_vars[(trip_id, i)]) == 1:
                             # This candidate was selected
                             solution.assignments.append({
                                 'trip_id': trip_id,
@@ -602,10 +675,12 @@ class CPSATOptimizer:
     """
     
     def __init__(self,
-                 driver_states: Dict[str, DriverState],
-                 distance_matrix: Optional[np.ndarray] = None,
-                 location_to_index: Optional[Dict[str, int]] = None,
-                 cost_config: Optional[Dict[str, float]] = None):  # ✅ NEW PARAMETER
+             driver_states: Dict[str, DriverState],
+             distance_matrix: Optional[np.ndarray] = None,
+             location_to_index: Optional[Dict[str, int]] = None,
+             cost_config: Optional[Dict[str, float]] = None,
+             max_solve_time_seconds: float = 30.0,  # ← ADD THIS
+             num_workers: int = 4):
         """
         Initialize the optimizer.
         
@@ -627,18 +702,20 @@ class CPSATOptimizer:
                 'emergency_rest_penalty': 50.0,
                 'outsourcing_base_cost': 200.0
             }
-        else:
-            print("✅ Using cost configuration from notebook:")
-            for key, value in self.cost_config.items():
-                print(f"   {key}: £{value}")
+        # else:
+            # print("✅ Using cost configuration from notebook:")
+            # for key, value in self.cost_config.items():
+            #     print(f"   {key}: £{value}")
         
         # Initialize components - PASS CONFIG TO CANDIDATE GENERATOR
+
         self.candidate_generator = CandidateGeneratorV2(
             driver_states=driver_states,
-            distance_matrix=distance_matrix,
+            distance_matrix=distance_matrix,  # For backward compatibility
             location_to_index=location_to_index,
-            cost_config=self.cost_config  # ✅ PASS CONFIG
+            cost_config=self.cost_config
         )
+
         
         self.metrics_calculator = MetricsCalculator(
             deadhead_cost_per_km=self.cost_config.get('deadhead_cost_per_km', 1.0),        # £ per km
@@ -649,8 +726,11 @@ class CPSATOptimizer:
         )
         
         self.cpsat_model = MultiDriverCPSATModel(
-            driver_states=driver_states,
-            metrics_calculator=self.metrics_calculator
+            driver_states=self.driver_states,
+            metrics_calculator=self.metrics_calculator,
+            cost_config=self.cost_config,  # ← ADD THIS
+            max_solve_time_seconds=max_solve_time_seconds,
+            num_workers=num_workers
         )
     
     def optimize(self,

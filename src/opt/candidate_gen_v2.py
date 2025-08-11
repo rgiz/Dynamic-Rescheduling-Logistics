@@ -103,46 +103,80 @@ class CandidateGeneratorV2:
     """
     Generates feasible reassignment candidates for disrupted trips.
     """
-    def __init__(self,
-                 driver_states: Dict[str, DriverState],
-                 distance_matrix: Optional[np.ndarray] = None,
-                 distance_km_matrix: Optional[np.ndarray] = None,    # NEW: Distance in km
-                 time_minutes_matrix: Optional[np.ndarray] = None,   # NEW: Time in minutes
-                 location_to_index: Optional[Dict[str, int]] = None,
-                 max_cascade_depth: int = 3,
-                 max_deadhead_minutes: float = 120,
-                 max_delay_minutes: float = 120,
-                 cost_config: Optional[Dict[str, float]] = None):  # ✅ NEW PARAMETER
-        """
-        Initialize candidate generator.
-        """
+    # def __init__(self,
+    #              driver_states: Dict[str, DriverState],
+    #              distance_matrix: Optional[np.ndarray] = None,
+    #              distance_km_matrix: Optional[np.ndarray] = None,    # NEW: Distance in km
+    #              time_minutes_matrix: Optional[np.ndarray] = None,   # NEW: Time in minutes
+    #              location_to_index: Optional[Dict[str, int]] = None,
+    #              max_cascade_depth: int = 3,
+    #              max_deadhead_minutes: float = 120,
+    #              max_delay_minutes: float = 120,
+    #              cost_config: Optional[Dict[str, float]] = None):  # ✅ NEW PARAMETER
+    #     """
+    #     Initialize candidate generator.
+    #     """
+    #     self.driver_states = driver_states
+    #     self.distance_matrix = distance_matrix
+    #     self.location_to_index = location_to_index
+    #     self.max_cascade_depth = max_cascade_depth
+    #     self.max_deadhead_minutes = max_deadhead_minutes
+    #     self.max_delay_minutes = max_delay_minutes
+        
+    #     # Store cost configuration
+    #     self.cost_config = cost_config or {}  # ✅ STORE CONFIG
+        
+    #     # Cache for performance
+    #     self._driver_availability_cache = {}
+
+    #     if distance_km_matrix is not None and time_minutes_matrix is not None:
+    #         # NEW FORMAT: Separate matrices for distance and time
+    #         self.distance_km_matrix = distance_km_matrix
+    #         self.time_minutes_matrix = time_minutes_matrix
+    #         self.distance_matrix = time_minutes_matrix  # Backward compatibility
+    #         print("✅ Using dual matrix format (distance_km + time_minutes)")
+    #     elif distance_matrix is not None:
+    #         # OLD FORMAT: Assume distance_matrix contains time in minutes
+    #         self.time_minutes_matrix = distance_matrix
+    #         self.distance_km_matrix = None  # Will estimate from time
+    #         print("⚠️ Using legacy matrix format - assuming time data")
+    #     else:
+    #         self.distance_km_matrix = None
+    #         self.time_minutes_matrix = None
+
+    def __init__(self, 
+                driver_states: Dict[str, DriverState],
+                distance_matrix: Optional[np.ndarray] = None,
+                distance_km_matrix: Optional[np.ndarray] = None,
+                time_minutes_matrix: Optional[np.ndarray] = None,
+                location_to_index: Optional[Dict[str, int]] = None,
+                max_cascade_depth: int = 3,
+                max_deadhead_minutes: float = 120,
+                max_delay_minutes: float = 120,
+                cost_config: Optional[Dict[str, float]] = None):
+        
         self.driver_states = driver_states
-        self.distance_matrix = distance_matrix
         self.location_to_index = location_to_index
         self.max_cascade_depth = max_cascade_depth
         self.max_deadhead_minutes = max_deadhead_minutes
         self.max_delay_minutes = max_delay_minutes
-        
-        # Store cost configuration
-        self.cost_config = cost_config or {}  # ✅ STORE CONFIG
-        
-        # Cache for performance
+        self.cost_config = cost_config or {}
         self._driver_availability_cache = {}
-
+        
+        # CLEAN: Only accept dual matrices - no fallback
         if distance_km_matrix is not None and time_minutes_matrix is not None:
-            # NEW FORMAT: Separate matrices for distance and time
             self.distance_km_matrix = distance_km_matrix
             self.time_minutes_matrix = time_minutes_matrix
-            self.distance_matrix = time_minutes_matrix  # Backward compatibility
+            self.distance_matrix = time_minutes_matrix
             print("✅ Using dual matrix format (distance_km + time_minutes)")
         elif distance_matrix is not None:
-            # OLD FORMAT: Assume distance_matrix contains time in minutes
+            # Allow single matrix for now, but prepare for dual matrix upgrade
             self.time_minutes_matrix = distance_matrix
-            self.distance_km_matrix = None  # Will estimate from time
-            print("⚠️ Using legacy matrix format - assuming time data")
-        else:
             self.distance_km_matrix = None
-            self.time_minutes_matrix = None
+            self.distance_matrix = distance_matrix
+            # print("⚡ Single matrix mode - will upgrade to dual matrices after init")
+        else:
+            raise ValueError("At least distance_matrix is required")
     
     def generate_candidates(self, 
                           disrupted_trip: Dict,
@@ -236,13 +270,14 @@ class CandidateGeneratorV2:
         """
         Try to insert a trip at a specific position in driver's day.
         """
+        
         candidate = ReassignmentCandidate(
             disrupted_trip_id=trip['id'],
             candidate_type='direct',
             assigned_driver_id=driver_id,
             position_in_day=position,
             cascade_depth=1,
-            cost_config=self.cost_config  # ✅ PASS CONFIG TO CANDIDATE
+            cost_config=self.cost_config
         )
         
         # Calculate deadhead and delays
@@ -269,9 +304,7 @@ class CandidateGeneratorV2:
                 
                 # Check for invalid connections
                 if deadhead_after == float('inf') or deadhead_miles_after == float('inf'):
-                    candidate.is_feasible = False
-                    candidate.violations.append("No valid connection to next assignment")
-                    return candidate
+                    return None
                 
                 # Check if we'd delay the first assignment
                 trip_end_with_deadhead = trip['end_time'] + timedelta(minutes=deadhead_after)
@@ -294,9 +327,7 @@ class CandidateGeneratorV2:
                 
                 # Check for invalid connections
                 if deadhead_before == float('inf') or deadhead_miles_before == float('inf'):
-                    candidate.is_feasible = False
-                    candidate.violations.append("No valid connection from previous assignment")
-                    return candidate
+                    return None
                 
                 # Check if we can reach the trip in time
                 earliest_arrival = last_assignment.end_time + timedelta(minutes=deadhead_before)
@@ -331,9 +362,7 @@ class CandidateGeneratorV2:
             # Check for invalid connections
             if (deadhead_before == float('inf') or deadhead_miles_before == float('inf') or
                 deadhead_after == float('inf') or deadhead_miles_after == float('inf')):
-                candidate.is_feasible = False
-                candidate.violations.append("No valid connections for insertion")
-                return candidate
+                return None
             
             # Check timing feasibility
             earliest_arrival = prev_assignment.end_time + timedelta(minutes=deadhead_before)
@@ -350,18 +379,16 @@ class CandidateGeneratorV2:
                 delay = max(delay, next_delay)
         
         # Set candidate metrics (both time and distance)
-        candidate.deadhead_minutes = deadhead_before + deadhead_after      # Time for constraints
-        candidate.deadhead_miles = deadhead_miles_before + deadhead_miles_after  # Distance for costs (in km now!)
+        candidate.deadhead_minutes = deadhead_before + deadhead_after
+        candidate.deadhead_miles = deadhead_miles_before + deadhead_miles_after
         candidate.delay_minutes = delay
         
         # Check feasibility constraints
         if candidate.deadhead_minutes > self.max_deadhead_minutes:
-            candidate.is_feasible = False
-            candidate.violations.append(f"Deadhead {candidate.deadhead_minutes:.0f} min > max {self.max_deadhead_minutes}")
+            return None  # Filter out excessive deadhead
             
         if candidate.delay_minutes > self.max_delay_minutes:
-            candidate.is_feasible = False
-            candidate.violations.append(f"Delay {candidate.delay_minutes:.0f} min > max {self.max_delay_minutes}")
+            return None  # Filter out excessive delays
         
         # Check if this would violate daily duty limit
         total_day_minutes = sum(a.duration_minutes for a in existing_assignments)
@@ -373,15 +400,13 @@ class CandidateGeneratorV2:
                 if driver_state.can_use_emergency_rest():
                     candidate.emergency_rest_used = True
                 else:
-                    candidate.is_feasible = False
-                    candidate.violations.append(f"Daily duty {total_day_minutes/60:.1f}h > 13h limit, no emergency rest available")
+                    return None  # Can't use emergency rest - filter out
             else:
-                candidate.is_feasible = False
-                candidate.violations.append(f"Daily duty {total_day_minutes/60:.1f}h > 13h limit")
+                return None  # Exceeds even emergency limit - filter out
         
         candidate.calculate_total_cost()
-
         return candidate
+
     
     def _generate_cascade_insertions(self,
                                     disrupted_trip: Dict,
@@ -412,6 +437,16 @@ class CandidateGeneratorV2:
                         continue
                     
                     driver_b_state = self.driver_states[driver_b_id]
+
+                    # ADD THIS CHECK HERE:
+                    # Check route feasibility before expensive operations
+                    if not self._is_route_feasible(disrupted_trip['start_location'], 
+                                                getattr(assignment_to_move, 'start_location', '')):
+                        continue  # Skip this cascade - route not feasible
+                    
+                    if not self._is_route_feasible(getattr(assignment_to_move, 'end_location', ''), 
+                                                disrupted_trip['end_location']):
+                        continue  # Skip this cascade - route not feasible
                     
                     # Check if Driver B can take the assignment
                     if self._can_take_assignment(driver_b_state, assignment_to_move, trip_date_str):
@@ -520,6 +555,23 @@ class CandidateGeneratorV2:
         except (KeyError, IndexError):
             # Location not found in matrix
             return float('inf')
+        
+    def _is_route_feasible(self, from_location: str, to_location: str) -> bool:
+        """Check if route between locations is feasible (not -999)."""
+        if not self.location_to_index or from_location == to_location:
+            return True
+        
+        from_idx = self.location_to_index.get(from_location)
+        to_idx = self.location_to_index.get(to_location)
+        
+        if from_idx is None or to_idx is None:
+            return False
+        
+        # Check both matrices for -999 flag
+        time_val = self.time_minutes_matrix[from_idx, to_idx] if self.time_minutes_matrix is not None else 0
+        dist_val = self.distance_km_matrix[from_idx, to_idx] if self.distance_km_matrix is not None else 0
+        
+        return time_val != -999 and dist_val != -999
         
     def _calculate_deadhead_miles(self,
                             from_location: str,
